@@ -45,12 +45,16 @@ def main() -> None:
     train_X, train_y, test_X, test_y = load_ucr_gunpoint()
     print(f"GunPoint train: {train_X.shape}, test: {test_X.shape}, classes: {np.unique(train_y)}")
 
+    # GunPoint series length is 150 — too short for embedding search with
+    # embedding_dimension=50 (gtda FNN trials need n > tau*(m-1)+1).
     transformer = TopGenTransformer(
         rep_names=("mtd",),
         hom_dims=(0, 1),
         blocks=("b1", "b2", "b3"),
         class_mode="A",
-        search_embedding=True,
+        search_embedding=False,
+        embedding_dimension=10,
+        embedding_time_delay=4,
         per_series_budget=30,
         query_size=15,
         class_subcloud_size=20,
@@ -61,6 +65,10 @@ def main() -> None:
     )
 
     transformer.fit(train_X, train_y)
+    print(
+        f"Takens params: tau={transformer.embedding_time_delay_}, "
+        f"m={transformer.embedding_dimension_}"
+    )
     train_features = transformer.transform(train_X, y=train_y)
     test_features = transformer.transform(test_X)
 

@@ -20,6 +20,40 @@ from topgen.features import (
 )
 
 
+def _embedding_search_caps(
+    series_length: int,
+    max_time_delay: int,
+    max_dimension: int,
+    stride: int,
+) -> tuple[int, int]:
+    """Cap giotto-tda search bounds so FNN trials fit the series length.
+
+    gtda needs ``n_timestamps > time_delay * (dimension - 1) + 1`` and evaluates
+    false-nearest-neighbours up to ``max_dimension + 2``. FNN also requires at
+    least two embedded points (``kneighbors`` with ``n_neighbors=2``).
+    """
+    td_cap = max(1, max_time_delay)
+    dim_cap = max(2, max_dimension)
+    while td_cap >= 1:
+        # Largest d with time_delay * (d - 1) <= series_length - 1 - stride.
+        max_fit_dim = (series_length - 1 - stride) // max(td_cap, 1) + 1
+        if dim_cap + 2 <= max_fit_dim:
+            break
+        dim_cap -= 1
+        if dim_cap < 2:
+            dim_cap = 2
+            td_cap -= 1
+    return max(1, td_cap), max(2, dim_cap)
+
+
+def _ensure_embedding_fits(series_length: int, time_delay: int, dimension: int) -> None:
+    if series_length <= time_delay * (dimension - 1) + 1:
+        raise ValueError(
+            f"Series length {series_length} is too short for Takens embedding with "
+            f"time_delay={time_delay} and dimension={dimension}."
+        )
+
+
 class TopGenTransformer(BaseEstimator, TransformerMixin):
     """Population-level topological features via cross-persistence between class clouds."""
 
@@ -167,13 +201,20 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
     def _fit_embedder(self, reference_series: np.ndarray) -> None:
         """Match Topological_classifier: search on one series, embed all with TakensEmbedding."""
         reference_series = np.asarray(reference_series, dtype=float).ravel()
+        series_length = reference_series.shape[0]
         if self.search_embedding:
+            time_delay_cap, dimension_cap = _embedding_search_caps(
+                series_length,
+                self.embedding_time_delay,
+                self.embedding_dimension,
+                self.stride,
+            )
             search_embedder = SingleTakensEmbedding(
                 parameters_type="search",
                 n_jobs=-1,
                 stride=self.stride,
-                time_delay=self.embedding_time_delay,
-                dimension=self.embedding_dimension,
+                time_delay=time_delay_cap,
+                dimension=dimension_cap,
             )
             search_embedder.fit(reference_series)
             time_delay = search_embedder.time_delay_
@@ -181,7 +222,10 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
         else:
             time_delay = self.embedding_time_delay
             dimension = self.embedding_dimension
+            _ensure_embedding_fits(series_length, time_delay, dimension)
 
+        self.embedding_time_delay_ = time_delay
+        self.embedding_dimension_ = dimension
         self.embedder_ = TakensEmbedding(
             time_delay=time_delay,
             dimension=dimension,
