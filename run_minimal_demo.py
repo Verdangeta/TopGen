@@ -57,7 +57,7 @@ def main() -> None:
         density_samples=15,
         stride=3,
         random_state=0,
-        pdist_device="cpu",
+        pdist_device="cuda",
     )
 
     transformer.fit(train_X, train_y)

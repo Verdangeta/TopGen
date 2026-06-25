@@ -7,7 +7,7 @@ Population-level topological features for time series classification.
 ```
 topgen/
   vectorizers.py   # level-1 vectorizers (persistence stats, log-signature, catch22)
-  clouds.py        # delay embedding, subsampling, provenance-tracked class clouds
+  clouds.py        # giotto-tda embedding, subsampling, provenance-tracked class clouds
   features.py      # MTopDiv cross-barcode wrapper, 3 feature blocks, self-densities
   topgen.py        # TopGenTransformer (sklearn API)
 run_minimal_demo.py
@@ -21,18 +21,17 @@ pip install -e external/MTopDiv
 pip install -r requirements.txt
 ```
 
-MTopDiv requires **CUDA + ripserplusplus** at runtime (see `external/MTopDiv/README.md`).
-On CPU-only hosts the library probes MTopDiv once and falls back to a `ripser`-based
-path with the same augmented-distance construction when the probe fails.
+**CUDA is required** for cross-barcode computation via MTopDiv/ripserplusplus.
+Use `pdist_device="cuda"` (default) or `pdist_device="cuda:0"`.
+
+Takens embedding uses **giotto-tda** (`SingleTakensEmbedding` + `TakensEmbedding`),
+matching `Topological_classifier.py` from the TDA_experiments repo.
 
 ## Minimal demo (R={MTD}, Mode A, H0+H1)
 
 ```bash
 python run_minimal_demo.py
 ```
-
-This fits `TopGenTransformer` on GunPoint and prints train/test feature matrices.
-Per-class feature count with the minimal config: **8** (4 B1 + 2 B2 + 2 B3) × number of classes.
 
 ## Input contract
 

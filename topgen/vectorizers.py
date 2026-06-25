@@ -5,20 +5,34 @@ from __future__ import annotations
 from typing import Callable
 
 import numpy as np
+from gtda.time_series import SingleTakensEmbedding, TakensEmbedding
 from sklearn.decomposition import PCA
 
-from topgen.clouds import delay_embed, embed, estimate_embedding_dimension, estimate_tau
+from topgen.clouds import embed_series
 
 
-def _persistence_stats_vector(series: np.ndarray, tau: int | None, m: int | None, stride: int) -> np.ndarray:
+def _persistence_stats_vector(
+    series: np.ndarray,
+    time_delay: int = 4,
+    dimension: int = 50,
+    stride: int = 1,
+) -> np.ndarray:
     """Persistence statistics of the delay embedding (placeholder for full H0/H1 stats)."""
     series = np.asarray(series, dtype=float).ravel()
-    tau = estimate_tau(series) if tau is None else tau
-    m = estimate_embedding_dimension(series, tau) if m is None else m
-    points = embed(series, tau, m, stride=stride)
-    pca = PCA(n_components=min(3, points.shape[1]))
-    cloud = pca.fit_transform(points)
-    # Minimal summary until the full persistence-stats arm is wired in.
+    search = SingleTakensEmbedding(
+        parameters_type="search",
+        time_delay=time_delay,
+        dimension=dimension,
+        stride=stride,
+        n_jobs=-1,
+    )
+    search.fit(series)
+    embedder = TakensEmbedding(
+        time_delay=search.time_delay_,
+        dimension=search.dimension_,
+        stride=stride,
+    )
+    cloud = PCA(n_components=3).fit_transform(embed_series(series, embedder))
     return np.concatenate(
         [
             cloud.mean(axis=0),

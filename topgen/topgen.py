@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+from gtda.time_series import SingleTakensEmbedding, TakensEmbedding
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.decomposition import PCA
 from sklearn.utils.validation import check_array, check_is_fitted
@@ -10,10 +11,7 @@ from sklearn.utils.validation import check_array, check_is_fitted
 from topgen.clouds import (
     build_class_cloud,
     build_series_cloud,
-    delay_embed,
-    embed,
-    estimate_embedding_dimension,
-    estimate_tau,
+    embed_series,
     sample_subcloud,
 )
 from topgen.features import (
@@ -28,8 +26,8 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
     def __init__(
         self,
         vectorizer: str = "embedding",
-        tau: int | None = None,
-        embedding_dimension: int | None = None,
+        embedding_dimension: int = 50,
+        embedding_time_delay: int = 4,
         search_embedding: bool = True,
         stride: int = 5,
         n_components: int = 3,
@@ -43,12 +41,12 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
         blocks: tuple[str, ...] = ("b1", "b2", "b3"),
         density_samples: int = 40,
         density_estimator: str = "kde",
-        pdist_device: str = "cpu",
+        pdist_device: str = "cuda",
         random_state: int = 42,
     ):
         self.vectorizer = vectorizer
-        self.tau = tau
         self.embedding_dimension = embedding_dimension
+        self.embedding_time_delay = embedding_time_delay
         self.search_embedding = search_embedding
         self.stride = stride
         self.n_components = n_components
@@ -73,9 +71,9 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
 
         self.rng_ = np.random.default_rng(self.random_state)
         self.classes_ = np.unique(y)
-        self._resolve_embedding_params(X[0])
+        self._fit_embedder(X[0])
 
-        embedded_train = [embed(X[idx], self.tau_, self.m_, stride=self.stride) for idx in range(X.shape[0])]
+        embedded_train = [embed_series(X[idx], self.embedder_) for idx in range(X.shape[0])]
         stacked = np.vstack(embedded_train)
         self.pca_ = PCA(n_components=min(self.n_components, stacked.shape[1]))
         self.pca_.fit(stacked)
@@ -92,9 +90,7 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
             cloud, prov = build_class_cloud(
                 series_list,
                 source_indices=class_indices.tolist(),
-                tau=self.tau_,
-                m_embed=self.m_,
-                stride=self.stride,
+                embedder=self.embedder_,
                 s=self.per_series_budget,
                 subsample_mode=self.subsample_mode,
                 pca=self.pca_,
@@ -125,9 +121,7 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
         for row_idx in range(X.shape[0]):
             query_cloud = build_series_cloud(
                 X[row_idx],
-                self.tau_,
-                self.m_,
-                self.stride,
+                self.embedder_,
                 self.query_size,
                 self.subsample_mode,
                 self.pca_,
@@ -170,17 +164,29 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
         features = np.nan_to_num(features, posinf=1e6, neginf=-1e6, nan=0.0)
         return features
 
-    def _resolve_embedding_params(self, reference_series: np.ndarray) -> None:
+    def _fit_embedder(self, reference_series: np.ndarray) -> None:
+        """Match Topological_classifier: search on one series, embed all with TakensEmbedding."""
+        reference_series = np.asarray(reference_series, dtype=float).ravel()
         if self.search_embedding:
-            self.tau_ = estimate_tau(reference_series) if self.tau is None else self.tau
-            self.m_ = (
-                estimate_embedding_dimension(reference_series, self.tau_)
-                if self.embedding_dimension is None
-                else self.embedding_dimension
+            search_embedder = SingleTakensEmbedding(
+                parameters_type="search",
+                n_jobs=-1,
+                stride=self.stride,
+                time_delay=self.embedding_time_delay,
+                dimension=self.embedding_dimension,
             )
+            search_embedder.fit(reference_series)
+            time_delay = search_embedder.time_delay_
+            dimension = search_embedder.dimension_
         else:
-            self.tau_ = 1 if self.tau is None else self.tau
-            self.m_ = 3 if self.embedding_dimension is None else self.embedding_dimension
+            time_delay = self.embedding_time_delay
+            dimension = self.embedding_dimension
+
+        self.embedder_ = TakensEmbedding(
+            time_delay=time_delay,
+            dimension=dimension,
+            stride=self.stride,
+        )
 
     def _per_class_feature_count(self) -> int:
         n_reps = len(self.rep_names)

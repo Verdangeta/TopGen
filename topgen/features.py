@@ -2,15 +2,11 @@
 
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
 from dataclasses import dataclass
 
 import mtd
 import numpy as np
 from scipy.stats import entropy, gaussian_kde
-from sklearn.metrics import pairwise_distances
 
 from topgen.clouds import sample_disjoint_pair
 
@@ -19,26 +15,6 @@ REPRESENTATIONS = ("mtd", "total_persistence", "pers_entropy", "landscape_l2", "
 
 # Fixed Betti thresholds (methodology §6); tuned once, not per dataset.
 BETTI_THRESHOLDS = (0.25, 0.5, 0.75)
-
-_MTD_AVAILABLE: bool | None = None
-
-
-def _probe_mtd() -> bool:
-    """Return True when MTopDiv can compute cross-barcodes in this environment."""
-    global _MTD_AVAILABLE
-    if _MTD_AVAILABLE is not None:
-        return _MTD_AVAILABLE
-    if os.environ.get("TOPGEN_FORCE_CPU", "").lower() in {"1", "true", "yes"}:
-        _MTD_AVAILABLE = False
-        return False
-    probe = (
-        "import numpy as np, mtd;"
-        "P=np.random.rand(8,3);Q=np.random.rand(6,3);"
-        "mtd.calc_cross_barcodes(P,Q,8,6,is_plot=False,pdist_device='cpu')"
-    )
-    result = subprocess.run([sys.executable, "-c", probe], capture_output=True)
-    _MTD_AVAILABLE = result.returncode == 0
-    return _MTD_AVAILABLE
 
 
 @dataclass
@@ -54,51 +30,17 @@ def cross_barcode(
     right: np.ndarray,
     batch_size_left: int,
     batch_size_right: int,
-    pdist_device: str = "cpu",
+    pdist_device: str = "cuda",
 ) -> np.ndarray:
     """Wrap MTopDiv cross-barcode computation (same convention as Topological_classifier)."""
-    if _probe_mtd():
-        return mtd.calc_cross_barcodes(
-            left,
-            right,
-            batch_size1=batch_size_left,
-            batch_size2=batch_size_right,
-            pdist_device=pdist_device,
-            is_plot=False,
-        )
-    return _cpu_cross_barcode_fallback(left, right, batch_size_left, batch_size_right)
-
-
-def _cpu_cross_barcode_fallback(
-    cloud_1: np.ndarray,
-    cloud_2: np.ndarray,
-    batch_size_left: int,
-    batch_size_right: int,
-    max_hom_dim: int = 1,
-) -> np.ndarray:
-    """CPU fallback using the same augmented-distance construction as MTopDiv."""
-    import ripser
-
-    rng = np.random.default_rng(0)
-    batch_size_left = min(batch_size_left, cloud_1.shape[0])
-    batch_size_right = min(batch_size_right, cloud_2.shape[0])
-    idx_left = rng.choice(cloud_1.shape[0], batch_size_left, replace=False)
-    idx_right = rng.choice(cloud_2.shape[0], batch_size_right, replace=False)
-    left = cloud_1[idx_left]
-    right = cloud_2[idx_right]
-
-    d1 = pairwise_distances(right, left)
-    d2 = pairwise_distances(right, right)
-    total = left.shape[0] + right.shape[0]
-    dist = np.zeros((total, total))
-    dist[left.shape[0] :, : left.shape[0]] = d1
-    dist[left.shape[0] :, left.shape[0] :] = d2
-    mean_sep = d1.mean()
-    dist[: left.shape[0], : left.shape[0]] = 0.0
-    dist[dist < mean_sep * 1e-6] = 0.0
-
-    diagrams = ripser.ripser(dist, maxdim=max_hom_dim, distance_matrix=True)["dgms"]
-    return np.asarray(diagrams, dtype=object)
+    return mtd.calc_cross_barcodes(
+        left,
+        right,
+        batch_size1=batch_size_left,
+        batch_size2=batch_size_right,
+        pdist_device=pdist_device,
+        is_plot=False,
+    )
 
 
 def _homology_bars(barcode: np.ndarray, hom_dim: int) -> np.ndarray:
@@ -215,7 +157,7 @@ def feature_blocks(
     blocks: tuple[str, ...],
     query_size: int,
     class_size: int,
-    pdist_device: str = "cpu",
+    pdist_device: str = "cuda",
     density_estimator: str = "kde",
 ) -> np.ndarray:
     """Assemble per-class feature slice: B1 raw, B2 asymmetry, B3 membership."""
@@ -250,7 +192,7 @@ def estimate_class_self_densities(
     n_samples: int,
     subsample_mode: str,
     rng: np.random.Generator,
-    pdist_device: str = "cpu",
+    pdist_device: str = "cuda",
 ) -> dict[tuple[str, int], FrozenDensity]:
     """Fit frozen self-densities from size-matched disjoint intra-class subsample pairs."""
     collected: dict[tuple[str, int], list[float]] = {
