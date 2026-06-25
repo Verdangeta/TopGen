@@ -11,9 +11,18 @@ from scipy.stats import entropy, gaussian_kde
 from topgen.clouds import sample_disjoint_pair
 
 
-REPRESENTATIONS = ("mtd", "total_persistence", "pers_entropy", "landscape_l2", "betti")
+# All seven linear representations from methodology §6 (per homology dimension).
+ALL_REP_NAMES: tuple[str, ...] = (
+    "mtd",
+    "total_persistence",
+    "pers_entropy",
+    "landscape_l2",
+    "betti_0",
+    "betti_1",
+    "betti_2",
+)
 
-# Fixed Betti thresholds (methodology §6); tuned once, not per dataset.
+REPRESENTATIONS = ALL_REP_NAMES
 BETTI_THRESHOLDS = (0.25, 0.5, 0.75)
 
 
@@ -73,7 +82,9 @@ def linear_reps(barcode: np.ndarray, hom_dims: tuple[int, ...] = (0, 1)) -> dict
         bars = _homology_bars(barcode, hom_dim)
         lifetimes = _lifetimes(bars, hom_dim)
         reps[("mtd", hom_dim)] = _clip_score(mtd.get_score(barcode, hom_dim, "sum_length"))
-        reps[("total_persistence", hom_dim)] = float(np.sum(lifetimes ** 2)) if lifetimes.size else 0.0
+        reps[("total_persistence", hom_dim)] = _clip_score(
+            mtd.get_score(barcode, hom_dim, "sum_sq_length")
+        )
         reps[("pers_entropy", hom_dim)] = float(entropy(lifetimes, base=2)) if lifetimes.size else 0.0
         reps[("landscape_l2", hom_dim)] = _landscape_l2_norm(lifetimes)
         for idx, threshold in enumerate(BETTI_THRESHOLDS):

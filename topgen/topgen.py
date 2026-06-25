@@ -15,6 +15,7 @@ from topgen.clouds import (
     sample_subcloud,
 )
 from topgen.features import (
+    ALL_REP_NAMES,
     estimate_class_self_densities,
     feature_blocks,
 )

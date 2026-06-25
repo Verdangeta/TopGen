@@ -11,6 +11,7 @@ topgen/
   features.py      # MTopDiv cross-barcode wrapper, 3 feature blocks, self-densities
   topgen.py        # TopGenTransformer (sklearn API)
 run_minimal_demo.py
+run_experiments.py
 ```
 
 ## Setup
@@ -32,6 +33,19 @@ matching `Topological_classifier.py` from the TDA_experiments repo.
 ```bash
 python run_minimal_demo.py
 ```
+
+This fits `TopGenTransformer` on GunPoint and prints train/test feature matrices.
+Per-class feature count with `R={MTD}`: **8** (4 B1 + 2 B2 + 2 B3) × number of classes.
+With all seven representations (`ALL_REP_NAMES`): **56** per class.
+
+## Experiments
+
+```bash
+python run_experiments.py
+```
+
+Runs TopGen (full 7 representations), catch22, FreshPRINCE, and TopGen+catch22 on
+GunPoint, Coffee, and ItalyPowerDemand. Writes `results/accuracy_table.csv`.
 
 ## Input contract
 
