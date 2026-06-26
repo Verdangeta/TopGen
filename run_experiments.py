@@ -59,6 +59,9 @@ TOPGEN_KWARGS = dict(
 
 RF_KWARGS = dict(n_estimators=200, n_jobs=-1)
 
+# Independent baseline: whole-series TSFresh → RotationForest (not used inside TopGen clouds).
+FRESHPRINCE_KWARGS = dict(default_fc_parameters="efficient", verbose=0)
+
 QUICK_DATASETS = ("GunPoint",)
 QUICK_SEEDS = (0,)
 QUICK_METHODS = ("TopGen", "catch22")
@@ -173,17 +176,24 @@ class AeonCatch22Pipeline(BaseEstimator, ClassifierMixin):
 
 
 class FreshPRINCEBaseline(BaseEstimator, ClassifierMixin):
-    """FreshPRINCE classifier baseline (aeon)."""
+    """Whole-series TSFresh features + RotationForest (aeon), independent of TopGen."""
 
-    def __init__(self, random_state: int = 0, rf_kwargs: dict | None = None):
+    def __init__(
+        self,
+        random_state: int = 0,
+        rf_kwargs: dict | None = None,
+        freshprince_kwargs: dict | None = None,
+    ):
         self.random_state = random_state
         self.rf_kwargs = RF_KWARGS if rf_kwargs is None else rf_kwargs
+        self.freshprince_kwargs = FRESHPRINCE_KWARGS if freshprince_kwargs is None else freshprince_kwargs
 
     def fit(self, X, y):
         self.estimator_ = FreshPRINCEClassifier(
             n_estimators=self.rf_kwargs["n_estimators"],
             random_state=self.random_state,
             n_jobs=self.rf_kwargs["n_jobs"],
+            **self.freshprince_kwargs,
         )
         X = np.asarray(X, dtype=float)
         if X.ndim == 2:
