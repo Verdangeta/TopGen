@@ -52,7 +52,7 @@ DATASETS = (
     "Earthquakes",
     "RefrigerationDevices",
 )
-SEEDS = (0, 1, 2, 3, 4)
+SEEDS = (0, 1)
 CV_FOLDS = 5
 
 UCR_BASE_URL = "https://timeseriesclassification.com/aeon-toolkit/{name}.zip"
