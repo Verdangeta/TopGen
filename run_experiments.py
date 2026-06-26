@@ -34,6 +34,7 @@ except ImportError:
 # --- experiment configuration ------------------------------------------------
 
 DATASETS = (
+    # General UCR benchmark mix
     "GunPoint",
     "Coffee",
     "ItalyPowerDemand",
@@ -44,6 +45,12 @@ DATASETS = (
     "OliveOil",
     "Lightning2",
     "Strawberry",
+    # Original-paper sanity check (TopGen vs SOTA complementarity)
+    "Worms",
+    "WormsTwoClass",
+    "Computers",
+    "Earthquakes",
+    "RefrigerationDevices",
 )
 SEEDS = (0, 1, 2, 3, 4)
 CV_FOLDS = 5
