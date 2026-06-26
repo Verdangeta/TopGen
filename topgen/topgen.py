@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 from gtda.time_series import SingleTakensEmbedding, TakensEmbedding
 from sklearn.base import BaseEstimator, TransformerMixin
@@ -78,6 +80,7 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
         density_estimator: str = "kde",
         pdist_device: str = "cuda",
         random_state: int = 42,
+        record_timing: bool = False,
     ):
         self.vectorizer = vectorizer
         self.embedding_dimension = embedding_dimension
@@ -97,8 +100,12 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
         self.density_estimator = density_estimator
         self.pdist_device = pdist_device
         self.random_state = random_state
+        self.record_timing = record_timing
 
     def fit(self, X, y):
+        fit_start = time.perf_counter()
+        timings: dict[str, float] = {}
+
         X = check_array(X, dtype=float, ensure_all_finite=True)
         y = np.asarray(y)
         if y.shape[0] != X.shape[0]:
@@ -106,22 +113,31 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
 
         self.rng_ = np.random.default_rng(self.random_state)
         self.classes_ = np.unique(y)
-        self._fit_embedder(X[0])
 
+        t0 = time.perf_counter()
+        self._fit_embedder(X[0])
+        timings["embedding_params"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
         embedded_train = [embed_series(X[idx], self.embedder_) for idx in range(X.shape[0])]
         stacked = np.vstack(embedded_train)
         self.pca_ = PCA(n_components=min(self.n_components, stacked.shape[1]))
         self.pca_.fit(stacked)
+        timings["pca_fit"] = time.perf_counter() - t0
 
         self.class_clouds_: dict[int, np.ndarray] = {}
         self.class_provenance_: dict[int, np.ndarray] = {}
         self.class_densities_: dict[int, dict] = {}
         self.n_train_samples_ = X.shape[0]
 
+        cloud_time = 0.0
+        density_time = 0.0
         for class_label in self.classes_:
             class_mask = y == class_label
             class_indices = np.where(class_mask)[0]
             series_list = [X[idx] for idx in class_indices]
+
+            t0 = time.perf_counter()
             cloud, prov = build_class_cloud(
                 series_list,
                 source_indices=class_indices.tolist(),
@@ -131,8 +147,11 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
                 pca=self.pca_,
                 rng=self.rng_,
             )
+            cloud_time += time.perf_counter() - t0
             self.class_clouds_[class_label] = cloud
             self.class_provenance_[class_label] = prov
+
+            t0 = time.perf_counter()
             self.class_densities_[class_label] = estimate_class_self_densities(
                 cloud,
                 prov,
@@ -145,15 +164,27 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
                 rng=self.rng_,
                 pdist_device=self.pdist_device,
             )
+            density_time += time.perf_counter() - t0
+
+        timings["class_clouds"] = cloud_time
+        timings["self_densities"] = density_time
+        timings["total"] = time.perf_counter() - fit_start
+        if self.record_timing:
+            self.fit_timings_ = timings
         self.n_features_out_ = len(self.classes_) * self._per_class_feature_count()
         return self
 
     def transform(self, X, y=None):
+        transform_start = time.perf_counter()
+        query_cloud_time = 0.0
+        cross_persistence_time = 0.0
+
         check_is_fitted(self, "class_clouds_")
         X = check_array(X, dtype=float, ensure_all_finite=True)
         y_array = None if y is None else np.asarray(y)
         rows = []
         for row_idx in range(X.shape[0]):
+            t0 = time.perf_counter()
             query_cloud = build_series_cloud(
                 X[row_idx],
                 self.embedder_,
@@ -162,6 +193,7 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
                 self.pca_,
                 self.rng_,
             )
+            query_cloud_time += time.perf_counter() - t0
             row_features = []
             for class_label in self.classes_:
                 exclude_series = None
@@ -180,6 +212,7 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
                     exclude_series=exclude_series,
                     class_mode=self.class_mode,
                 )
+                t0 = time.perf_counter()
                 row_features.append(
                     feature_blocks(
                         query_cloud,
@@ -194,9 +227,16 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
                         density_estimator=self.density_estimator,
                     )
                 )
+                cross_persistence_time += time.perf_counter() - t0
             rows.append(np.concatenate(row_features))
         features = np.vstack(rows)
         features = np.nan_to_num(features, posinf=1e6, neginf=-1e6, nan=0.0)
+        if self.record_timing:
+            self.transform_timings_ = {
+                "query_clouds": query_cloud_time,
+                "cross_persistence": cross_persistence_time,
+                "total": time.perf_counter() - transform_start,
+            }
         return features
 
     def _fit_embedder(self, reference_series: np.ndarray) -> None:

@@ -41,11 +41,16 @@ With all seven representations (`ALL_REP_NAMES`): **56** per class.
 ## Experiments
 
 ```bash
-python run_experiments.py
+python run_experiments.py --quick    # ~1–2 min smoke test (GunPoint, holdout only)
+python run_experiments.py            # full grid (slow: many GPU cross-barcode fits)
 ```
 
-Runs TopGen (full 7 representations), catch22, FreshPRINCE, and TopGen+catch22 on
-GunPoint, Coffee, and ItalyPowerDemand. Writes `results/accuracy_table.csv`.
+Full run cost is dominated by **MTopDiv cross-barcodes**, not UCR series length: each
+(query × class) pair runs 2 cross-barcodes; fit adds `n_classes × density_samples` more.
+The runner prints a cross-barcode budget estimate at startup and per-method stage timings
+(embedding, class clouds, self-densities, cross-persistence, RF).
+
+Output CSV includes `time_fit_s`, `time_predict_s`, and `time_detail_json` per row.
 
 ## Input contract
 
