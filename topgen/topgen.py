@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import warnings
 
 import numpy as np
 from gtda.time_series import SingleTakensEmbedding, TakensEmbedding
@@ -47,6 +48,53 @@ def _embedding_search_caps(
             dim_cap = 2
             td_cap -= 1
     return max(1, td_cap), max(2, dim_cap)
+
+
+def _embedded_point_count(series_length: int, time_delay: int, dimension: int, stride: int) -> int:
+    """Number of Takens vectors for a univariate series of given length."""
+    span = time_delay * (dimension - 1)
+    if series_length <= span:
+        return 0
+    return (series_length - span) // stride
+
+
+def _cap_fixed_embedding(
+    series_length: int,
+    time_delay: int,
+    dimension: int,
+    stride: int,
+    min_embedded_points: int = 5,
+) -> tuple[int, int, int]:
+    """Reduce (tau, m, stride) so Takens embedding fits and yields enough points."""
+    td = max(1, int(time_delay))
+    dim = max(2, int(dimension))
+    s = max(1, int(stride))
+
+    def fits(t: int, d: int, st: int) -> bool:
+        return series_length > t * (d - 1) + 1
+
+    def viable(t: int, d: int, st: int) -> bool:
+        return fits(t, d, st) and _embedded_point_count(series_length, t, d, st) >= min_embedded_points
+
+    if viable(td, dim, s):
+        return td, dim, s
+
+    for s_try in range(s, 0, -1):
+        for d_try in range(dim, 1, -1):
+            for t_try in range(td, 0, -1):
+                if viable(t_try, d_try, s_try):
+                    return t_try, d_try, s_try
+
+    for s_try in range(s, 0, -1):
+        for d_try in range(dim, 1, -1):
+            for t_try in range(td, 0, -1):
+                if fits(t_try, d_try, s_try):
+                    return t_try, d_try, s_try
+
+    raise ValueError(
+        f"Series length {series_length} is too short for any Takens embedding "
+        f"(requested time_delay={time_delay}, dimension={dimension}, stride={stride})."
+    )
 
 
 def _ensure_embedding_fits(series_length: int, time_delay: int, dimension: int) -> None:
@@ -260,17 +308,33 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
             search_embedder.fit(reference_series)
             time_delay = search_embedder.time_delay_
             dimension = search_embedder.dimension_
+            stride = self.stride
         else:
-            time_delay = self.embedding_time_delay
-            dimension = self.embedding_dimension
-            _ensure_embedding_fits(series_length, time_delay, dimension)
+            time_delay, dimension, stride = _cap_fixed_embedding(
+                series_length,
+                self.embedding_time_delay,
+                self.embedding_dimension,
+                self.stride,
+            )
+            if (
+                time_delay != self.embedding_time_delay
+                or dimension != self.embedding_dimension
+                or stride != self.stride
+            ):
+                warnings.warn(
+                    f"Short series (length={series_length}): capped Takens embedding from "
+                    f"tau={self.embedding_time_delay}, m={self.embedding_dimension}, "
+                    f"stride={self.stride} to tau={time_delay}, m={dimension}, stride={stride}.",
+                    stacklevel=2,
+                )
 
         self.embedding_time_delay_ = time_delay
         self.embedding_dimension_ = dimension
+        self.stride_ = stride
         self.embedder_ = TakensEmbedding(
             time_delay=time_delay,
             dimension=dimension,
-            stride=self.stride,
+            stride=stride,
         )
 
     def _per_class_feature_count(self) -> int:

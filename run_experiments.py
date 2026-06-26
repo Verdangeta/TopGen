@@ -405,6 +405,7 @@ def run_experiments(
     topgen_kwargs: dict,
     rf_kwargs: dict,
     run_cv: bool,
+    output_csv: str | None = None,
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     jobs = [(dataset, seed, method) for dataset in datasets for seed in seeds for method in methods]
@@ -446,10 +447,12 @@ def run_experiments(
             + (f"  cv={cv_acc:.4f}" if run_cv else "")
             + f"  {_format_timings(timings)}"
         )
+        if output_csv is not None:
+            write_csv(rows, output_csv, quiet=True)
     return rows
 
 
-def write_csv(rows: list[dict[str, object]], path: str = OUTPUT_CSV) -> None:
+def write_csv(rows: list[dict[str, object]], path: str = OUTPUT_CSV, quiet: bool = False) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     fieldnames = [
         "dataset",
@@ -466,7 +469,8 @@ def write_csv(rows: list[dict[str, object]], path: str = OUTPUT_CSV) -> None:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-    print(f"\nWrote {path}")
+    if not quiet:
+        print(f"\nWrote {path}")
 
 
 def main() -> None:
@@ -512,7 +516,7 @@ def main() -> None:
         run_cv=run_cv,
     )
 
-    rows = run_experiments(datasets, seeds, methods, topgen_kwargs, rf_kwargs, run_cv)
+    rows = run_experiments(datasets, seeds, methods, topgen_kwargs, rf_kwargs, run_cv, output)
     write_csv(rows, output)
 
 
