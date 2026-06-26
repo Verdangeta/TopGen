@@ -398,7 +398,7 @@ def run_experiments(
         train_X, train_y, test_X, test_y = data_cache[dataset]
         X_all = np.vstack([train_X, test_X])
         y_all = np.concatenate([train_y, test_y])
-        n_classes = len(np.unique(y_train))
+        n_classes = len(np.unique(train_y))
 
         if len(rows) == 0 or rows[-1]["dataset"] != dataset:
             print(f"\n{dataset}: train {train_X.shape}, test {test_X.shape}, classes={n_classes}")
