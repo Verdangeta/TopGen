@@ -42,7 +42,7 @@ With all seven representations (`ALL_REP_NAMES`): **56** per class.
 
 ```bash
 python run_experiments.py --quick    # ~1–2 min smoke test (GunPoint, holdout only)
-python run_experiments.py            # full grid (slow: many GPU cross-barcode fits)
+python run_experiments.py            # 10 UCR datasets, full grid (slow: many GPU cross-barcode fits)
 ```
 
 Full run cost is dominated by **MTopDiv cross-barcodes**, not UCR series length: each

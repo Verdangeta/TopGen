@@ -33,7 +33,18 @@ except ImportError:
 
 # --- experiment configuration ------------------------------------------------
 
-DATASETS = ("GunPoint", "Coffee", "ItalyPowerDemand")
+DATASETS = (
+    "GunPoint",
+    "Coffee",
+    "ItalyPowerDemand",
+    "ECG200",
+    "ArrowHead",
+    "Plane",
+    "Herring",
+    "OliveOil",
+    "Lightning2",
+    "Strawberry",
+)
 SEEDS = (0, 1, 2, 3, 4)
 CV_FOLDS = 5
 
