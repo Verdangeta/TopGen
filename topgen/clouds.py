@@ -46,11 +46,18 @@ def build_series_cloud(
     s: int,
     subsample_mode: str,
     pca: PCA,
-    rng: np.random.Generator,
+    rng: np.random.Generator | None = None,
+    seed: int | None = None,
 ) -> np.ndarray:
-    """Embed one series, PCA-project, and subsample to budget s."""
+    """Embed one series, PCA-project, and subsample to budget s.
+
+    When ``seed`` is given the subsample uses a fresh deterministic generator so
+    the same series always yields the same cloud (no dependence on call order).
+    """
     embedded = embed_series(series, embedder)
     projected = pca.transform(embedded)
+    if seed is not None:
+        rng = np.random.default_rng(seed)
     return subsample(projected, s, subsample_mode, rng)
 
 
@@ -80,13 +87,22 @@ def sample_subcloud(
     provenance: np.ndarray,
     size: int,
     mode: str,
-    rng: np.random.Generator,
+    rng: np.random.Generator | None = None,
     exclude_series: int | None = None,
     class_mode: str = "A",
+    seed: int | None = None,
 ) -> np.ndarray:
-    """Draw class-side subsample C_c' with optional provenance exclusion."""
+    """Draw class-side subsample C_c' with optional provenance exclusion.
+
+    With ``seed`` the draw is deterministic for a given (class, exclusion): the
+    same class always yields the same right cloud, so identical query series get
+    identical features. If the available points are at or below ``size`` they are
+    all returned (no subsampling), which keeps the right cloud size-matched.
+    """
     if cloud.shape[0] == 0:
         return cloud.copy()
+    if seed is not None:
+        rng = np.random.default_rng(seed)
     mask = np.ones(cloud.shape[0], dtype=bool)
     if exclude_series is not None:
         mask &= provenance != exclude_series
@@ -122,34 +138,3 @@ def _mode_b_subsample(
             local_points = cloud[point_idx]
             chosen_idx.append(point_idx[int(np.argmax(pairwise_distances(local_points).sum(axis=1)))])
     return cloud[chosen_idx]
-
-
-def sample_disjoint_pair(
-    cloud: np.ndarray,
-    provenance: np.ndarray,
-    left_size: int,
-    right_size: int,
-    mode: str,
-    rng: np.random.Generator,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Two disjoint subsamples for self-density estimation."""
-    if cloud.shape[0] < left_size + right_size:
-        left = subsample(cloud, min(left_size, cloud.shape[0]), mode, rng)
-        remaining_mask = np.ones(cloud.shape[0], dtype=bool)
-        left_idx = _nearest_indices(cloud, left)
-        remaining_mask[left_idx] = False
-        right_pool = cloud[remaining_mask]
-        right = subsample(right_pool, min(right_size, right_pool.shape[0]), mode, rng)
-        return left, right
-    perm = rng.permutation(cloud.shape[0])
-    left_idx = perm[:left_size]
-    right_idx = perm[left_size : left_size + right_size]
-    return cloud[left_idx], cloud[right_idx]
-
-
-def _nearest_indices(cloud: np.ndarray, subset: np.ndarray) -> np.ndarray:
-    """Indices of cloud points that coincide with rows of subset (approximate)."""
-    if subset.shape[0] == 0:
-        return np.array([], dtype=int)
-    dists = pairwise_distances(cloud, subset)
-    return np.unique(np.argmin(dists, axis=0))

@@ -8,8 +8,6 @@ import mtd
 import numpy as np
 from scipy.stats import entropy, gaussian_kde
 
-from topgen.clouds import sample_disjoint_pair
-
 
 # All seven linear representations from methodology §6 (per homology dimension).
 ALL_REP_NAMES: tuple[str, ...] = (
@@ -23,7 +21,11 @@ ALL_REP_NAMES: tuple[str, ...] = (
 )
 
 REPRESENTATIONS = ALL_REP_NAMES
-BETTI_THRESHOLDS = (0.25, 0.5, 0.75)
+
+# Betti thresholds are quantiles of the lifetimes observed at fit time (frozen),
+# not absolute cutoffs: PCA-space lifetimes are unnormalised so a fixed cutoff
+# produces dead (all-constant) features. See betti_thresholds_from_lifetimes.
+BETTI_QUANTILES = (0.25, 0.5, 0.75)
 
 
 @dataclass
@@ -54,7 +56,7 @@ def cross_barcode(
 
 def _homology_bars(barcode: np.ndarray, hom_dim: int) -> np.ndarray:
     """Return (n, 2) birth-death array for homology dimension hom_dim."""
-    if barcode.shape[0] <= hom_dim:
+    if len(barcode) <= hom_dim:
         return np.empty((0, 2), dtype=float)
     bars = np.asarray(barcode[hom_dim], dtype=float)
     if bars.size == 0:
@@ -75,8 +77,37 @@ def _lifetimes(bars: np.ndarray, hom_dim: int) -> np.ndarray:
     return np.clip(lifetimes, 0.0, 1e6)
 
 
-def linear_reps(barcode: np.ndarray, hom_dims: tuple[int, ...] = (0, 1)) -> dict[tuple[str, int], float]:
-    """Scalar linear representations for each homology dimension."""
+def barcode_lifetimes(barcode: np.ndarray, hom_dim: int) -> np.ndarray:
+    """Lifetimes of a cross-barcode at one homology dim (H0 bars are death-only)."""
+    return _lifetimes(_homology_bars(barcode, hom_dim), hom_dim)
+
+
+def betti_thresholds_from_lifetimes(
+    lifetimes_by_hom: dict[int, np.ndarray],
+    quantiles: tuple[float, ...] = BETTI_QUANTILES,
+) -> dict[int, np.ndarray]:
+    """Freeze per-homology Betti thresholds as quantiles of observed lifetimes."""
+    thresholds: dict[int, np.ndarray] = {}
+    for hom_dim, lifetimes in lifetimes_by_hom.items():
+        lifetimes = np.asarray(lifetimes, dtype=float)
+        lifetimes = lifetimes[np.isfinite(lifetimes)]
+        if lifetimes.size == 0:
+            thresholds[hom_dim] = np.zeros(len(quantiles), dtype=float)
+        else:
+            thresholds[hom_dim] = np.quantile(lifetimes, quantiles)
+    return thresholds
+
+
+def linear_reps(
+    barcode: np.ndarray,
+    hom_dims: tuple[int, ...] = (0, 1),
+    betti_thresholds: dict[int, np.ndarray] | None = None,
+) -> dict[tuple[str, int], float]:
+    """Scalar linear representations for each homology dimension.
+
+    ``betti_thresholds`` maps a homology dim to its frozen quantile cutoffs. When
+    omitted, thresholds fall back to this barcode's own lifetime quantiles.
+    """
     reps: dict[tuple[str, int], float] = {}
     for hom_dim in hom_dims:
         bars = _homology_bars(barcode, hom_dim)
@@ -87,8 +118,16 @@ def linear_reps(barcode: np.ndarray, hom_dims: tuple[int, ...] = (0, 1)) -> dict
         )
         reps[("pers_entropy", hom_dim)] = float(entropy(lifetimes, base=2)) if lifetimes.size else 0.0
         reps[("landscape_l2", hom_dim)] = _landscape_l2_norm(lifetimes)
-        for idx, threshold in enumerate(BETTI_THRESHOLDS):
-            reps[(f"betti_{idx}", hom_dim)] = float(np.sum(lifetimes >= threshold)) if lifetimes.size else 0.0
+        if betti_thresholds is not None and hom_dim in betti_thresholds:
+            cutoffs = betti_thresholds[hom_dim]
+        elif lifetimes.size:
+            cutoffs = np.quantile(lifetimes, BETTI_QUANTILES)
+        else:
+            cutoffs = np.zeros(len(BETTI_QUANTILES), dtype=float)
+        for idx, threshold in enumerate(cutoffs):
+            reps[(f"betti_{idx}", hom_dim)] = (
+                float(np.sum(lifetimes >= threshold)) if lifetimes.size else 0.0
+            )
     return reps
 
 
@@ -109,9 +148,12 @@ def scalar_rep_value(
     barcode: np.ndarray,
     rep_name: str,
     hom_dim: int,
+    betti_thresholds: dict[int, np.ndarray] | None = None,
 ) -> float:
     """Evaluate one representation on one cross-barcode."""
-    return linear_reps(barcode, hom_dims=(hom_dim,))[(rep_name, hom_dim)]
+    return linear_reps(barcode, hom_dims=(hom_dim,), betti_thresholds=betti_thresholds)[
+        (rep_name, hom_dim)
+    ]
 
 
 def self_density_fit(values: np.ndarray) -> FrozenDensity:
@@ -159,27 +201,22 @@ def self_density_tail(
     raise ValueError(f"Unknown density estimator '{estimator}'")
 
 
-def feature_blocks(
-    query_cloud: np.ndarray,
-    class_subcloud: np.ndarray,
+def assemble_blocks(
+    barcode_qc: np.ndarray,
+    barcode_cq: np.ndarray,
     densities: dict[tuple[str, int], FrozenDensity],
     rep_names: tuple[str, ...],
     hom_dims: tuple[int, ...],
     blocks: tuple[str, ...],
-    query_size: int,
-    class_size: int,
-    pdist_device: str = "cuda",
+    betti_thresholds: dict[int, np.ndarray] | None = None,
     density_estimator: str = "kde",
 ) -> np.ndarray:
-    """Assemble per-class feature slice: B1 raw, B2 asymmetry, B3 membership."""
+    """Per-class feature slice from precomputed barcodes: B1 raw, B2 asym, B3 membership."""
     features: list[float] = []
-    barcode_qc = cross_barcode(query_cloud, class_subcloud, query_size, class_size, pdist_device)
-    barcode_cq = cross_barcode(class_subcloud, query_cloud, class_size, query_size, pdist_device)
-
     for hom_dim in hom_dims:
         for rep_name in rep_names:
-            val_qc = scalar_rep_value(barcode_qc, rep_name, hom_dim)
-            val_cq = scalar_rep_value(barcode_cq, rep_name, hom_dim)
+            val_qc = scalar_rep_value(barcode_qc, rep_name, hom_dim, betti_thresholds)
+            val_cq = scalar_rep_value(barcode_cq, rep_name, hom_dim, betti_thresholds)
             if "b1" in blocks:
                 features.extend([val_qc, val_cq])
             if "b2" in blocks:
@@ -193,40 +230,29 @@ def feature_blocks(
     return np.asarray(features, dtype=float)
 
 
-def estimate_class_self_densities(
-    class_cloud: np.ndarray,
-    class_provenance: np.ndarray,
+def feature_blocks(
+    query_cloud: np.ndarray,
+    class_subcloud: np.ndarray,
+    densities: dict[tuple[str, int], FrozenDensity],
     rep_names: tuple[str, ...],
     hom_dims: tuple[int, ...],
-    left_size: int,
-    right_size: int,
-    n_samples: int,
-    subsample_mode: str,
-    rng: np.random.Generator,
+    blocks: tuple[str, ...],
+    query_size: int,
+    class_size: int,
     pdist_device: str = "cuda",
-) -> dict[tuple[str, int], FrozenDensity]:
-    """Fit frozen self-densities from size-matched disjoint intra-class subsample pairs."""
-    collected: dict[tuple[str, int], list[float]] = {
-        (rep_name, hom_dim): [] for rep_name in rep_names for hom_dim in hom_dims
-    }
-    for _ in range(n_samples):
-        left, right = sample_disjoint_pair(
-            class_cloud,
-            class_provenance,
-            left_size,
-            right_size,
-            subsample_mode,
-            rng,
-        )
-        if left.shape[0] == 0 or right.shape[0] == 0:
-            continue
-        barcode = cross_barcode(left, right, left.shape[0], right.shape[0], pdist_device)
-        for hom_dim in hom_dims:
-            for rep_name in rep_names:
-                collected[(rep_name, hom_dim)].append(
-                    scalar_rep_value(barcode, rep_name, hom_dim)
-                )
-    densities: dict[tuple[str, int], FrozenDensity] = {}
-    for key, values in collected.items():
-        densities[key] = self_density_fit(np.asarray(values, dtype=float))
-    return densities
+    density_estimator: str = "kde",
+    betti_thresholds: dict[int, np.ndarray] | None = None,
+) -> np.ndarray:
+    """Compute both-order cross-barcodes for a query/class pair, then assemble blocks."""
+    barcode_qc = cross_barcode(query_cloud, class_subcloud, query_size, class_size, pdist_device)
+    barcode_cq = cross_barcode(class_subcloud, query_cloud, class_size, query_size, pdist_device)
+    return assemble_blocks(
+        barcode_qc,
+        barcode_cq,
+        densities,
+        rep_names,
+        hom_dims,
+        blocks,
+        betti_thresholds=betti_thresholds,
+        density_estimator=density_estimator,
+    )
