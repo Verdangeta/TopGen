@@ -55,21 +55,23 @@ def main() -> None:
         search_embedding=False,
         embedding_dimension=10,
         embedding_time_delay=4,
-        per_series_budget=30,
-        query_size=15,
-        class_subcloud_size=20,
-        density_samples=15,
+        per_series_fraction=1.0,
+        query_fraction=1.0,
+        class_fraction=1.0,
+        min_cloud_points=15,
+        max_cloud_points=80,
         stride=3,
         random_state=0,
         pdist_device="cuda",
     )
 
-    transformer.fit(train_X, train_y)
+    # fit_transform returns the cached leakage-free train features (single LOO pass);
+    # transform is out-of-sample only.
+    train_features = transformer.fit_transform(train_X, train_y)
     print(
         f"Takens params: tau={transformer.embedding_time_delay_}, "
         f"m={transformer.embedding_dimension_}"
     )
-    train_features = transformer.transform(train_X, y=train_y)
     test_features = transformer.transform(test_X)
 
     print(f"Feature matrix shape (train): {train_features.shape}")
