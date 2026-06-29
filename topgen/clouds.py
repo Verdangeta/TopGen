@@ -14,6 +14,21 @@ def embed_series(series: np.ndarray, embedder: TakensEmbedding) -> np.ndarray:
     return embedder.fit_transform(series.reshape(1, -1))[0]
 
 
+def cloud_budget(
+    n_available: int,
+    fraction: float,
+    min_points: int,
+    max_points: int,
+    small_threshold: int = 100,
+) -> int:
+    """Target subsample size: use all points when the cloud is small, else apply fraction."""
+    if n_available <= 0:
+        return 0
+    if n_available < small_threshold:
+        return n_available
+    return int(np.clip(round(fraction * n_available), min_points, max_points))
+
+
 def subsample(points: np.ndarray, s: int, mode: str, rng: np.random.Generator) -> np.ndarray:
     """Subsample up to s points using maxmin coverage or uniform random draws."""
     points = np.asarray(points, dtype=float)
@@ -43,19 +58,27 @@ def _maxmin_subsample(points: np.ndarray, s: int, rng: np.random.Generator) -> n
 def build_series_cloud(
     series: np.ndarray,
     embedder: TakensEmbedding,
-    s: int,
     subsample_mode: str,
     pca: PCA,
+    fraction: float = 1.0,
+    min_points: int = 20,
+    max_points: int = 500,
+    small_threshold: int = 100,
     rng: np.random.Generator | None = None,
     seed: int | None = None,
 ) -> np.ndarray:
-    """Embed one series, PCA-project, and subsample to budget s.
+    """Embed one series, PCA-project, and subsample to a fraction-based budget.
+
+    When the embedded cloud has fewer than ``small_threshold`` points, **all**
+    points are kept (no fraction downsampling). Otherwise the budget is
+    ``clip(round(fraction * n_available), min_points, max_points)``.
 
     When ``seed`` is given the subsample uses a fresh deterministic generator so
     the same series always yields the same cloud (no dependence on call order).
     """
     embedded = embed_series(series, embedder)
     projected = pca.transform(embedded)
+    s = cloud_budget(projected.shape[0], fraction, min_points, max_points, small_threshold)
     if seed is not None:
         rng = np.random.default_rng(seed)
     return subsample(projected, s, subsample_mode, rng)
@@ -65,16 +88,29 @@ def build_class_cloud(
     series_list: list[np.ndarray],
     source_indices: list[int],
     embedder: TakensEmbedding,
-    s: int,
     subsample_mode: str,
     pca: PCA,
-    rng: np.random.Generator,
+    fraction: float = 1.0,
+    min_points: int = 20,
+    max_points: int = 500,
+    small_threshold: int = 100,
+    rng: np.random.Generator | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Pool per-series clouds into one class cloud with provenance indices."""
     chunks = []
     provenance = []
     for series, src_idx in zip(series_list, source_indices):
-        cloud = build_series_cloud(series, embedder, s, subsample_mode, pca, rng)
+        cloud = build_series_cloud(
+            series,
+            embedder,
+            subsample_mode,
+            pca,
+            fraction=fraction,
+            min_points=min_points,
+            max_points=max_points,
+            small_threshold=small_threshold,
+            rng=rng,
+        )
         chunks.append(cloud)
         provenance.append(np.full(cloud.shape[0], src_idx, dtype=int))
     if not chunks:

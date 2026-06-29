@@ -70,12 +70,16 @@ Output CSV includes `dataset_type`, `is_dynamical`, `time_fit_s`, `time_predict_
 ## Cloud sizes (asymmetric, fraction-based)
 
 Cross-barcodes are asymmetric, so the left (query) and right (class) clouds are sized
-independently:
+independently. **If a cloud has fewer than `small_cloud_threshold` points (default 100),
+all points are used** — no fraction downsampling. Otherwise:
 
-- **Left / query** = `clip(query_fraction * per-series embedded points, min_cloud_points, max_query_points)`.
-- **Right / class** = `clip(class_fraction * |pooled class cloud|, min_cloud_points, max_class_points)`,
-  computed per class (the class cloud can be far larger than one series, hence its own
-  higher cap).
+- **Left / query** (one series): `clip(query_fraction × n_embedded, min_cloud_points, max_query_points)`.
+- **Per-series contribution to pooled class cloud**: same rule with `per_series_fraction`.
+- **Right / class** (pooled): `clip(class_fraction × |C_c|, min_cloud_points, max_class_points)`,
+  per class.
+
+Set `debug_sizes=True` on `TopGenTransformer` to print resolved cloud shapes and
+cross-barcode batch sizes during fit (first LOO row) and transform (first test row).
 
 The same per-class right size `M'` is used for self-density, train (LOO), and test, so sizes
 stay matched (methodology §8). The right (class) cloud is deterministic per class, so

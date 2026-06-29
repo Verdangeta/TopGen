@@ -55,15 +55,17 @@ def main() -> None:
         search_embedding=False,
         embedding_dimension=10,
         embedding_time_delay=4,
-        per_series_fraction=1.0,
-        query_fraction=0.6,
+        per_series_fraction=0.8,
+        query_fraction=0.8,
         class_fraction=0.8,
         min_cloud_points=15,
-        max_query_points=80,
+        max_query_points=500,
         max_class_points=400,
+        small_cloud_threshold=100,
         stride=3,
         random_state=0,
         pdist_device="cuda",
+        debug_sizes=True,
     )
 
     # fit_transform returns the cached leakage-free train features (single LOO pass);

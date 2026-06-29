@@ -15,6 +15,7 @@ from sklearn.utils.validation import check_array, check_is_fitted
 from topgen.clouds import (
     build_class_cloud,
     build_series_cloud,
+    cloud_budget,
     embed_series,
     sample_subcloud,
 )
@@ -114,12 +115,13 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
         search_embedding: bool = True,
         stride: int = 5,
         n_components: int = 3,
-        per_series_fraction: float = 1.0,
-        query_fraction: float = 0.6,
+        per_series_fraction: float = 0.8,
+        query_fraction: float = 0.8,
         class_fraction: float = 0.8,
         min_cloud_points: int = 20,
         max_query_points: int = 500,
         max_class_points: int = 1000,
+        small_cloud_threshold: int = 100,
         subsample_mode: str = "maxmin",
         class_mode: str = "A",
         rep_names: tuple[str, ...] = ("mtd",),
@@ -130,6 +132,7 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
         pdist_device: str = "cuda",
         random_state: int = 42,
         record_timing: bool = False,
+        debug_sizes: bool = False,
     ):
         self.vectorizer = vectorizer
         self.embedding_dimension = embedding_dimension
@@ -149,6 +152,7 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
         self.min_cloud_points = min_cloud_points
         self.max_query_points = max_query_points
         self.max_class_points = max_class_points
+        self.small_cloud_threshold = small_cloud_threshold
         self.subsample_mode = subsample_mode
         self.class_mode = class_mode
         self.rep_names = rep_names
@@ -159,6 +163,7 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
         self.pdist_device = pdist_device
         self.random_state = random_state
         self.record_timing = record_timing
+        self.debug_sizes = debug_sizes
 
     def fit(self, X, y):
         """Leave-one-series-out pass: builds class clouds, freezes self-densities,
@@ -200,9 +205,12 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
                 series_list,
                 source_indices=class_indices.tolist(),
                 embedder=self.embedder_,
-                s=self.per_series_budget_,
                 subsample_mode=self.subsample_mode,
                 pca=self.pca_,
+                fraction=self.per_series_fraction,
+                min_points=self.min_cloud_points,
+                max_points=self.max_query_points,
+                small_threshold=self.small_cloud_threshold,
                 rng=self.rng_,
             )
             self.class_clouds_[class_label] = cloud
@@ -215,6 +223,7 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
             for class_label in self.classes_
         }
         timings["class_clouds"] = time.perf_counter() - t0
+        self._debug_fit_clouds()
 
         # --- LOO pass 1: query-vs-class cross-barcodes (the GPU-heavy step) ------
         t0 = time.perf_counter()
@@ -232,6 +241,17 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
                     if in_class
                     else self.class_subclouds_[class_label]
                 )
+                if self.debug_sizes and i == 0:
+                    self._debug_scoring_pair(
+                        stage="fit_LOO",
+                        row=i,
+                        y_i=int(y[i]),
+                        class_label=int(class_label),
+                        in_class=in_class,
+                        query_cloud=query_cloud,
+                        right_cloud=right,
+                        exclude=None if not in_class else int(i),
+                    )
                 bc_qc, bc_cq = self._both_orders(query_cloud, right)
                 pairs[class_label] = (bc_qc, bc_cq)
                 for hom_dim in self.hom_dims:
@@ -305,6 +325,13 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
             np.vstack(rows), posinf=1e6, neginf=-1e6, nan=0.0
         )
 
+        if self.debug_sizes:
+            self._debug(
+                f"fit done: train_features_ {self.train_features_.shape}, "
+                f"features/class={self._per_class_feature_count()}, "
+                f"density_repeats={self.density_repeats}"
+            )
+
         timings["total"] = time.perf_counter() - fit_start
         if self.record_timing:
             self.fit_timings_ = timings
@@ -335,6 +362,17 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
             row_features = []
             for class_label in self.classes_:
                 class_subcloud = self.class_subclouds_[class_label]
+                if self.debug_sizes and row_idx == 0:
+                    self._debug_scoring_pair(
+                        stage="transform",
+                        row=row_idx,
+                        y_i=None,
+                        class_label=int(class_label),
+                        in_class=None,
+                        query_cloud=query_cloud,
+                        right_cloud=class_subcloud,
+                        exclude=None,
+                    )
                 t0 = time.perf_counter()
                 row_features.append(
                     feature_blocks(
@@ -383,9 +421,12 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
         return build_series_cloud(
             series,
             self.embedder_,
-            self.query_size_,
             self.subsample_mode,
             self.pca_,
+            fraction=self.query_fraction,
+            min_points=self.min_cloud_points,
+            max_points=self.max_query_points,
+            small_threshold=self.small_cloud_threshold,
             seed=self._seed("query"),
         )
 
@@ -423,30 +464,52 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
                 )
 
     def _resolve_sizes(self, embedded_counts: list[int]) -> None:
-        """Left-side budgets: per-series contribution and query (single series)."""
+        """Store median embedded count (reference for debug / H1 warning)."""
         ref = int(np.median(embedded_counts)) if embedded_counts else self.min_cloud_points
         self.n_embed_ref_ = ref
-
-        def resolve_query(fraction: float) -> int:
-            value = int(round(fraction * ref))
-            return int(np.clip(value, self.min_cloud_points, self.max_query_points))
-
-        self.per_series_budget_ = resolve_query(self.per_series_fraction)
-        self.query_size_ = resolve_query(self.query_fraction)
+        self._example_query_budget_ = cloud_budget(
+            ref,
+            self.query_fraction,
+            self.min_cloud_points,
+            self.max_query_points,
+            self.small_cloud_threshold,
+        )
+        self._example_per_series_budget_ = cloud_budget(
+            ref,
+            self.per_series_fraction,
+            self.min_cloud_points,
+            self.max_query_points,
+            self.small_cloud_threshold,
+        )
+        if self.debug_sizes:
+            rule = (
+                "all points (< threshold)"
+                if ref < self.small_cloud_threshold
+                else f"fraction (threshold={self.small_cloud_threshold})"
+            )
+            self._debug(
+                f"embedding ref: median_embedded={ref} ({rule}); "
+                f"example per_series_budget={self._example_per_series_budget_}, "
+                f"example query_budget={self._example_query_budget_}"
+            )
 
     def _resolve_class_sizes(self) -> None:
-        """Right-side budget per class: a fraction of the pooled class cloud.
-
-        The target M' is kept achievable when one series is excluded (LOO), so the
-        same M' is used at train and test (exact size-matching, methodology §8).
-        """
+        """Right-side budget per class: fraction of pooled cloud (all if small)."""
         self.class_subcloud_size_: dict[int, int] = {}
         for class_label in self.classes_:
             cloud = self.class_clouds_[class_label]
             prov = self.class_provenance_[class_label]
             n_total = cloud.shape[0]
-            target = int(np.clip(round(self.class_fraction * n_total),
-                                 self.min_cloud_points, self.max_class_points))
+            if n_total < self.small_cloud_threshold:
+                target = n_total
+            else:
+                target = int(
+                    np.clip(
+                        round(self.class_fraction * n_total),
+                        self.min_cloud_points,
+                        self.max_class_points,
+                    )
+                )
             if n_total and prov.size:
                 max_series_pts = int(np.unique(prov, return_counts=True)[1].max())
                 loo_available = n_total - max_series_pts
@@ -456,13 +519,62 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
 
         if 1 in self.hom_dims:
             smallest = min(self.class_subcloud_size_.values(), default=0)
-            if min(self.query_size_, smallest) < 15:
+            example_q = getattr(self, "_example_query_budget_", self.min_cloud_points)
+            if min(example_q, smallest) < 15:
                 warnings.warn(
-                    f"Resolved cloud sizes (query={self.query_size_}, "
+                    f"Resolved cloud sizes (example query={example_q}, "
                     f"min class={smallest}) are small for H1; cross-barcode H1 may be "
                     "noisy. Consider a smaller stride or H0-only hom_dims.",
                     stacklevel=2,
                 )
+
+    def _debug(self, message: str) -> None:
+        if self.debug_sizes:
+            print(f"[TopGen sizes] {message}")
+
+    def _debug_fit_clouds(self) -> None:
+        if not self.debug_sizes:
+            return
+        self._debug(
+            f"Takens: tau={self.embedding_time_delay_}, m={self.embedding_dimension_}, "
+            f"stride={self.stride_}, PCA dim={self.pca_.n_components_}"
+        )
+        for class_label in self.classes_:
+            cloud = self.class_clouds_[class_label]
+            sub = self.class_subclouds_[class_label]
+            n_series = len(np.unique(self.class_provenance_[class_label]))
+            self._debug(
+                f"class {class_label}: pooled |C|={cloud.shape[0]} from {n_series} series, "
+                f"target M'={self.class_subcloud_size_[class_label]}, "
+                f"actual C'={sub.shape[0]}"
+            )
+
+    def _debug_scoring_pair(
+        self,
+        stage: str,
+        row: int,
+        y_i: int | None,
+        class_label: int,
+        in_class: bool | None,
+        query_cloud: np.ndarray,
+        right_cloud: np.ndarray,
+        exclude: int | None,
+    ) -> None:
+        if not self.debug_sizes:
+            return
+        tag = f"{stage} row={row}"
+        if y_i is not None:
+            tag += f" y={y_i}"
+        if in_class is not None:
+            tag += f" in_class={in_class}"
+        if exclude is not None:
+            tag += f" exclude_series={exclude}"
+        self._debug(
+            f"{tag} vs class {class_label}: "
+            f"Q {query_cloud.shape}  C' {right_cloud.shape}  →  "
+            f"cross_barcode(Q,C') batch=({query_cloud.shape[0]}, {right_cloud.shape[0]}), "
+            f"cross_barcode(C',Q) batch=({right_cloud.shape[0]}, {query_cloud.shape[0]})"
+        )
 
     def _fit_embedder(self, X: np.ndarray) -> None:
         """Pick Takens (tau, m): median of a search over several series, then cap so
