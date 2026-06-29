@@ -118,7 +118,7 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
         query_fraction: float = 0.6,
         class_fraction: float = 0.8,
         min_cloud_points: int = 20,
-        max_query_points: int = 150,
+        max_query_points: int = 500,
         max_class_points: int = 1000,
         subsample_mode: str = "maxmin",
         class_mode: str = "A",
