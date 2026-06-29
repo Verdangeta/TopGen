@@ -33,30 +33,65 @@ except ImportError:
 
 # --- experiment configuration ------------------------------------------------
 
-DATASETS = (
-    # General UCR benchmark mix
+# UCR "type" field per dataset. Delay embedding presumes dynamics, so the premise
+# holds for dynamical types (SENSOR/MOTION/ECG/DEVICE/EOG/HEMODYNAMICS) and not
+# for non-dynamical ones (SPECTRO/IMAGE). We report these groups separately.
+DATASET_TYPES: dict[str, str] = {
+    "GunPoint": "MOTION",
+    "ItalyPowerDemand": "SENSOR",
+    "ECG200": "ECG",
+    "Plane": "SENSOR",
+    "Lightning2": "SENSOR",
+    "Earthquakes": "SENSOR",
+    "Computers": "DEVICE",
+    "RefrigerationDevices": "DEVICE",
+    "Worms": "MOTION",
+    "WormsTwoClass": "MOTION",
+    "Coffee": "SPECTRO",
+    "OliveOil": "SPECTRO",
+    "Strawberry": "SPECTRO",
+    "ArrowHead": "IMAGE",
+    "Herring": "IMAGE",
+}
+DYNAMICAL_TYPES = frozenset({"SENSOR", "MOTION", "ECG", "DEVICE", "EOG", "HEMODYNAMICS"})
+
+
+def is_dynamical(dataset: str) -> bool:
+    """Whether delay embedding's dynamical premise plausibly holds for a dataset."""
+    return DATASET_TYPES.get(dataset, "UNKNOWN") in DYNAMICAL_TYPES
+
+
+# Disjoint dataset split for honest evaluation: tune hyperparameters ONLY on the
+# tuning set (or via nested CV), then report on the held-out report set. Never
+# tune on a reported dataset.
+TUNING_DATASETS = (
+    "ItalyPowerDemand",  # SENSOR
+    "Plane",             # SENSOR
+    "Worms",             # MOTION
+    "Computers",         # DEVICE
+    "Coffee",            # SPECTRO (non-dynamical contrast)
+)
+REPORT_DATASETS = (
+    # Dynamical (premise holds) — primary result
     "GunPoint",
-    "Coffee",
-    "ItalyPowerDemand",
     "ECG200",
-    "ArrowHead",
-    "Plane",
-    "Herring",
-    "OliveOil",
     "Lightning2",
-    "Strawberry",
-    # Original-paper sanity check (TopGen vs SOTA complementarity)
-    "Worms",
-    "WormsTwoClass",
-    "Computers",
     "Earthquakes",
     "RefrigerationDevices",
+    "WormsTwoClass",
+    # Non-dynamical (premise does not hold) — labelled contrast
+    "OliveOil",
+    "Strawberry",
+    "ArrowHead",
+    "Herring",
 )
-SEEDS = (0, 1)
+DATASETS = REPORT_DATASETS
+SEEDS = (0, 1, 2, 3, 4)
 CV_FOLDS = 5
 
 UCR_BASE_URL = "https://timeseriesclassification.com/aeon-toolkit/{name}.zip"
 OUTPUT_CSV = "results/accuracy_table.csv"
+IMPORTANCE_DIR = "results/feature_importances"
 
 TOPGEN_KWARGS = dict(
     rep_names=ALL_REP_NAMES,
@@ -66,10 +101,12 @@ TOPGEN_KWARGS = dict(
     search_embedding=False,
     embedding_dimension=10,
     embedding_time_delay=4,
-    per_series_budget=30,
-    query_size=15,
-    class_subcloud_size=20,
-    density_samples=15,
+    per_series_fraction=1.0,
+    query_fraction=1.0,
+    class_fraction=1.0,
+    min_cloud_points=20,
+    max_cloud_points=120,
+    density_repeats=1,
     stride=3,
     pdist_device="cuda",
     record_timing=True,
@@ -86,7 +123,6 @@ QUICK_METHODS = ("TopGen", "catch22")
 QUICK_TOPGEN_KWARGS = {
     **TOPGEN_KWARGS,
     "rep_names": ("mtd",),
-    "density_samples": 10,
 }
 QUICK_RF_KWARGS = dict(n_estimators=50, n_jobs=-1)
 
@@ -105,19 +141,19 @@ def explain_runtime_cost(
     run_cv: bool,
 ) -> None:
     """Print cross-barcode budget — dominant cost even on small UCR series."""
-    density_samples = topgen_kwargs.get("density_samples", 15)
+    density_repeats = topgen_kwargs.get("density_repeats", 1)
     n_reps = len(topgen_kwargs.get("rep_names", ("mtd",)))
-    # feature_blocks: 2 cross-barcodes per (series, class); reps share each barcode.
-    fit_xbarc = n_classes * density_samples
-    train_xbarc = n_train * n_classes * 2
+    # LOO fit: every train series is scored vs every class (2 cross-barcodes each);
+    # in-class density repeats add (R-1) more query-on-left barcodes per series.
+    fit_xbarc = n_train * n_classes * 2 + n_train * max(density_repeats - 1, 0)
     test_xbarc = n_test * n_classes * 2
-    per_holdout = fit_xbarc + train_xbarc + test_xbarc
+    per_holdout = fit_xbarc + test_xbarc
     cv_multiplier = 1 + CV_FOLDS if run_cv else 1
     grid = n_datasets * n_seeds * n_methods * cv_multiplier
     print(
         "Runtime is dominated by GPU cross-barcodes (MTopDiv), not dataset size.\n"
         f"  Per TopGen holdout (this split): ~{per_holdout} cross-barcodes "
-        f"({fit_xbarc} fit densities + {train_xbarc} train + {test_xbarc} test),\n"
+        f"({fit_xbarc} LOO fit + {test_xbarc} test),\n"
         f"  {n_reps} linear reps each reuse the same barcode.\n"
         f"  Full grid: {n_datasets} datasets × {n_seeds} seeds × {n_methods} methods "
         f"× {cv_multiplier} (holdout{' + CV' if run_cv else ''}) = {grid} estimator fits.\n"
@@ -246,18 +282,20 @@ class TopGenRFClassifier(BaseEstimator, ClassifierMixin):
         total_start = time.perf_counter()
 
         self.topgen_ = TopGenTransformer(random_state=self.random_state, **self.topgen_kwargs)
+        # Single LOO pass: fit_transform returns the cached leakage-free train matrix.
         t0 = time.perf_counter()
-        self.topgen_.fit(X, y)
+        X_train = self.topgen_.fit_transform(X, y)
         self.timings_["topgen_fit"] = time.perf_counter() - t0
-
-        t0 = time.perf_counter()
-        X_train = self.topgen_.transform(X, y=y)
-        self.timings_["topgen_transform_train"] = time.perf_counter() - t0
 
         t0 = time.perf_counter()
         self.rf_ = RandomForestClassifier(random_state=self.random_state, **self.rf_kwargs)
         self.rf_.fit(X_train, y)
         self.timings_["rf_fit"] = time.perf_counter() - t0
+
+        # Feature importances aligned with TopGen feature names (Fix 5: confirm
+        # TopGen features are used, not overfit).
+        self.feature_importances_ = self.rf_.feature_importances_
+        self.feature_names_ = list(self.topgen_.get_feature_names_out())
 
         if hasattr(self.topgen_, "fit_timings_"):
             for key, value in self.topgen_.fit_timings_.items():
@@ -425,6 +463,8 @@ def run_experiments(
         estimator = _method_factory(method_name, seed, topgen_kwargs, rf_kwargs)
         holdout_acc, timings = evaluate_holdout_timed(train_X, train_y, test_X, test_y, estimator)
 
+        save_feature_importances(estimator, dataset, method_name, seed)
+
         cv_acc = float("nan")
         if run_cv:
             cv_estimator = _method_factory(method_name, seed, topgen_kwargs, rf_kwargs)
@@ -432,6 +472,8 @@ def run_experiments(
 
         row = {
             "dataset": dataset,
+            "dataset_type": DATASET_TYPES.get(dataset, "UNKNOWN"),
+            "is_dynamical": is_dynamical(dataset),
             "method": method_name,
             "seed": seed,
             "holdout_accuracy": holdout_acc,
@@ -452,10 +494,48 @@ def run_experiments(
     return rows
 
 
+def save_feature_importances(estimator, dataset: str, method_name: str, seed: int) -> None:
+    """Dump RandomForest importances aligned with TopGen feature names (Fix 5)."""
+    importances = getattr(estimator, "feature_importances_", None)
+    names = getattr(estimator, "feature_names_", None)
+    if importances is None or names is None:
+        return
+    os.makedirs(IMPORTANCE_DIR, exist_ok=True)
+    path = os.path.join(IMPORTANCE_DIR, f"{dataset}_{method_name}_seed{seed}.json")
+    ranked = sorted(
+        ({"feature": n, "importance": float(v)} for n, v in zip(names, importances)),
+        key=lambda item: item["importance"],
+        reverse=True,
+    )
+    with open(path, "w") as handle:
+        json.dump(ranked, handle, indent=2)
+
+
+def summarize_by_type(rows: list[dict[str, object]]) -> None:
+    """Print mean holdout accuracy per method, split by dynamical vs non-dynamical."""
+    print("\nMean holdout accuracy by method (dynamical premise holds vs not):")
+    methods = sorted({row["method"] for row in rows})
+    for group_label, predicate in (
+        ("dynamical", lambda r: r["is_dynamical"]),
+        ("non-dynamical", lambda r: not r["is_dynamical"]),
+    ):
+        print(f"  [{group_label}]")
+        for method in methods:
+            accs = [
+                row["holdout_accuracy"]
+                for row in rows
+                if row["method"] == method and predicate(row)
+            ]
+            if accs:
+                print(f"    {method:16s} {np.mean(accs):.4f}  (n={len(accs)})")
+
+
 def write_csv(rows: list[dict[str, object]], path: str = OUTPUT_CSV, quiet: bool = False) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     fieldnames = [
         "dataset",
+        "dataset_type",
+        "is_dynamical",
         "method",
         "seed",
         "holdout_accuracy",
@@ -518,6 +598,7 @@ def main() -> None:
 
     rows = run_experiments(datasets, seeds, methods, topgen_kwargs, rf_kwargs, run_cv, output)
     write_csv(rows, output)
+    summarize_by_type(rows)
 
 
 if __name__ == "__main__":
