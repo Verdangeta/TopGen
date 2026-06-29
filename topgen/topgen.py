@@ -115,10 +115,11 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
         stride: int = 5,
         n_components: int = 3,
         per_series_fraction: float = 1.0,
-        query_fraction: float = 1.0,
-        class_fraction: float = 1.0,
+        query_fraction: float = 0.6,
+        class_fraction: float = 0.8,
         min_cloud_points: int = 20,
-        max_cloud_points: int = 200,
+        max_query_points: int = 150,
+        max_class_points: int = 1000,
         subsample_mode: str = "maxmin",
         class_mode: str = "A",
         rep_names: tuple[str, ...] = ("mtd",),
@@ -136,14 +137,18 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
         self.search_embedding = search_embedding
         self.stride = stride
         self.n_components = n_components
-        # Cloud sizes are fractions of the per-series embedded-point count (with a
-        # floor and a compute cap), so clouds scale with the data and stay size-
-        # matched across self-density / train / test (methodology §8).
+        # Cross-barcodes are asymmetric, so the left (query) and right (class)
+        # clouds are sized independently. The left is a single series: a fraction
+        # of that series' embedded points. The right is a fraction of the pooled
+        # class cloud (which can be far larger), with its own higher cap. Sizes
+        # are still matched between self-density / train / test per class
+        # (methodology §8) because the same target M' is used in fit and transform.
         self.per_series_fraction = per_series_fraction
         self.query_fraction = query_fraction
         self.class_fraction = class_fraction
         self.min_cloud_points = min_cloud_points
-        self.max_cloud_points = max_cloud_points
+        self.max_query_points = max_query_points
+        self.max_class_points = max_class_points
         self.subsample_mode = subsample_mode
         self.class_mode = class_mode
         self.rep_names = rep_names
@@ -202,6 +207,8 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
             )
             self.class_clouds_[class_label] = cloud
             self.class_provenance_[class_label] = prov
+        # Right (class) cloud size per class: a fraction of the pooled cloud.
+        self._resolve_class_sizes()
         # Default (no-exclusion) right cloud per class; deterministic and reused.
         self.class_subclouds_: dict[int, np.ndarray] = {
             class_label: self._class_subcloud(class_label, None)
@@ -390,7 +397,7 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
         return sample_subcloud(
             self.class_clouds_[class_label],
             self.class_provenance_[class_label],
-            self.class_subcloud_size_,
+            self.class_subcloud_size_[class_label],
             self.subsample_mode,
             seed=seed,
             exclude_series=exclude_series,
@@ -416,24 +423,46 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
                 )
 
     def _resolve_sizes(self, embedded_counts: list[int]) -> None:
-        """Turn cloud-size fractions into absolute, size-matched point budgets."""
+        """Left-side budgets: per-series contribution and query (single series)."""
         ref = int(np.median(embedded_counts)) if embedded_counts else self.min_cloud_points
-
-        def resolve(fraction: float) -> int:
-            value = int(round(fraction * ref))
-            return int(np.clip(value, self.min_cloud_points, self.max_cloud_points))
-
         self.n_embed_ref_ = ref
-        self.per_series_budget_ = resolve(self.per_series_fraction)
-        self.query_size_ = resolve(self.query_fraction)
-        self.class_subcloud_size_ = resolve(self.class_fraction)
-        if 1 in self.hom_dims and min(self.query_size_, self.class_subcloud_size_) < 15:
-            warnings.warn(
-                f"Resolved cloud sizes (query={self.query_size_}, "
-                f"class={self.class_subcloud_size_}) are small for H1; cross-barcode "
-                "H1 may be noisy. Consider a smaller stride or H0-only hom_dims.",
-                stacklevel=2,
-            )
+
+        def resolve_query(fraction: float) -> int:
+            value = int(round(fraction * ref))
+            return int(np.clip(value, self.min_cloud_points, self.max_query_points))
+
+        self.per_series_budget_ = resolve_query(self.per_series_fraction)
+        self.query_size_ = resolve_query(self.query_fraction)
+
+    def _resolve_class_sizes(self) -> None:
+        """Right-side budget per class: a fraction of the pooled class cloud.
+
+        The target M' is kept achievable when one series is excluded (LOO), so the
+        same M' is used at train and test (exact size-matching, methodology §8).
+        """
+        self.class_subcloud_size_: dict[int, int] = {}
+        for class_label in self.classes_:
+            cloud = self.class_clouds_[class_label]
+            prov = self.class_provenance_[class_label]
+            n_total = cloud.shape[0]
+            target = int(np.clip(round(self.class_fraction * n_total),
+                                 self.min_cloud_points, self.max_class_points))
+            if n_total and prov.size:
+                max_series_pts = int(np.unique(prov, return_counts=True)[1].max())
+                loo_available = n_total - max_series_pts
+                if loo_available >= self.min_cloud_points:
+                    target = min(target, loo_available)
+            self.class_subcloud_size_[class_label] = int(max(1, min(target, n_total)))
+
+        if 1 in self.hom_dims:
+            smallest = min(self.class_subcloud_size_.values(), default=0)
+            if min(self.query_size_, smallest) < 15:
+                warnings.warn(
+                    f"Resolved cloud sizes (query={self.query_size_}, "
+                    f"min class={smallest}) are small for H1; cross-barcode H1 may be "
+                    "noisy. Consider a smaller stride or H0-only hom_dims.",
+                    stacklevel=2,
+                )
 
     def _fit_embedder(self, X: np.ndarray) -> None:
         """Pick Takens (tau, m): median of a search over several series, then cap so

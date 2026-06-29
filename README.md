@@ -67,10 +67,16 @@ Output CSV includes `dataset_type`, `is_dynamical`, `time_fit_s`, `time_predict_
   train features. `transform(X)` is **out-of-sample only** (single-series query vs frozen,
   deterministic class clouds) — do not pass train rows back through `transform`.
 
-## Cloud sizes (fraction-based)
+## Cloud sizes (asymmetric, fraction-based)
 
-Cloud sizes are fractions of the per-series embedded-point count (`per_series_fraction`,
-`query_fraction`, `class_fraction`) with a floor (`min_cloud_points`) and compute cap
-(`max_cloud_points`). The same fractions drive query, class subcloud, and self-density, so
-sizes stay matched (methodology §8). The right (class) cloud is deterministic per class, so
+Cross-barcodes are asymmetric, so the left (query) and right (class) clouds are sized
+independently:
+
+- **Left / query** = `clip(query_fraction * per-series embedded points, min_cloud_points, max_query_points)`.
+- **Right / class** = `clip(class_fraction * |pooled class cloud|, min_cloud_points, max_class_points)`,
+  computed per class (the class cloud can be far larger than one series, hence its own
+  higher cap).
+
+The same per-class right size `M'` is used for self-density, train (LOO), and test, so sizes
+stay matched (methodology §8). The right (class) cloud is deterministic per class, so
 identical input series produce identical features.
