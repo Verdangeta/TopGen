@@ -531,6 +531,7 @@ def run_experiments(
     generator_names = _unique_generators(methods)
     split_jobs = [(dataset, seed) for dataset in datasets for seed in seeds]
     last_dataset = None
+    reset_feature_importance_csv(IMPORTANCE_DIR)
 
     for dataset, seed in tqdm(split_jobs, desc="splits", unit="split"):
         if dataset not in data_cache:
@@ -607,6 +608,37 @@ def run_experiments(
     return rows
 
 
+def _importance_csv_path(out_dir: str) -> str:
+    return os.path.join(out_dir, os.path.basename(IMPORTANCE_CSV))
+
+
+def _write_importance_header(path: str) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=IMPORTANCE_FIELDS)
+        writer.writeheader()
+
+
+def reset_feature_importance_csv(out_dir: str = IMPORTANCE_DIR) -> None:
+    """Start each runner invocation with a clean long-format importance table."""
+    _write_importance_header(_importance_csv_path(out_dir))
+
+
+def ensure_feature_importance_header(out_dir: str) -> str:
+    """Return a CSV path whose header matches the current long-format schema."""
+    path = _importance_csv_path(out_dir)
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        _write_importance_header(path)
+        return path
+
+    with open(path, newline="") as handle:
+        reader = csv.reader(handle)
+        header = next(reader, [])
+    if tuple(header) != IMPORTANCE_FIELDS:
+        _write_importance_header(path)
+    return path
+
+
 def save_feature_importances(
     rf,
     feature_records,
@@ -640,9 +672,7 @@ def save_feature_importances(
             f"feature records {len(feature_records)} != importance length {len(importances)}"
         )
 
-    os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, os.path.basename(IMPORTANCE_CSV))
-    write_header = not os.path.exists(path)
+    path = ensure_feature_importance_header(out_dir)
     rows = []
     for meta, importance, importance_std in zip(feature_records, importances, stds):
         rows.append(
@@ -665,8 +695,6 @@ def save_feature_importances(
         )
     with open(path, "a", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=IMPORTANCE_FIELDS)
-        if write_header:
-            writer.writeheader()
         writer.writerows(rows)
 
 

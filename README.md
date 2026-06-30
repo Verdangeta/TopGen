@@ -83,7 +83,7 @@ and per-method stage timings (embedding, class clouds, self-densities, cross-per
 Datasets are split into a disjoint `TUNING_DATASETS` set and a reported `REPORT_DATASETS`
 set, and each result row is tagged by UCR `dataset_type` / `is_dynamical` so dynamical
 (premise holds) and non-dynamical (premise does not) datasets can be reported separately.
-Feature importances (permutation on the held-out split) are appended to
+Feature importances (permutation on the held-out split) are written to a fresh
 `results/feature_importances/feature_importances.csv` — one long-format row per feature
 per run, tagged with `experiment` and `source` (`topgen` / `catch22` / `tsfresh`) so you
 can ask whether TopGen features keep signal next to the baselines.
