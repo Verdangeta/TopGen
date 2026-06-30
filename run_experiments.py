@@ -322,6 +322,7 @@ class TopGenRFClassifier(BaseEstimator, ClassifierMixin):
         predict_start = time.perf_counter()
         t0 = time.perf_counter()
         X_test = self.topgen_.transform(X)
+        self.last_test_features_ = X_test
         self.timings_["topgen_transform_test"] = time.perf_counter() - t0
 
         t0 = time.perf_counter()
@@ -476,7 +477,7 @@ def run_experiments(
         estimator = _method_factory(method_name, seed, topgen_kwargs, rf_kwargs)
         holdout_acc, timings = evaluate_holdout_timed(train_X, train_y, test_X, test_y, estimator)
 
-        if method_name == "TopGen" and hasattr(estimator, "topgen_") and hasattr(estimator, "rf_"):
+        if method_name == "TopGen" and hasattr(estimator, "rf_") and hasattr(estimator, "last_test_features_"):
             save_feature_importances(
                 estimator.rf_,
                 estimator.topgen_,
@@ -485,7 +486,7 @@ def run_experiments(
                 dataset_type=DATASET_TYPES.get(dataset, "UNKNOWN"),
                 is_dynamical=is_dynamical(dataset),
                 out_dir=IMPORTANCE_DIR,
-                X_val=estimator.topgen_.transform(test_X),
+                X_val=estimator.last_test_features_,
                 y_val=test_y,
             )
 
