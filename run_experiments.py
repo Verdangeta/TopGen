@@ -604,11 +604,19 @@ def main() -> None:
         action="store_true",
         help="Skip cross-validation; run the train/test holdout split only (faster).",
     )
+    parser.add_argument(
+        "--seeds",
+        type=int,
+        nargs="+",
+        default=None,
+        metavar="SEED",
+        help="Random seeds to run (default: 0 for --quick, 0-4 for full run).",
+    )
     args = parser.parse_args()
 
     if args.quick:
         datasets = QUICK_DATASETS
-        seeds = QUICK_SEEDS
+        seeds = tuple(args.seeds) if args.seeds is not None else QUICK_SEEDS
         methods = QUICK_METHODS
         topgen_kwargs = QUICK_TOPGEN_KWARGS
         rf_kwargs = QUICK_RF_KWARGS
@@ -616,7 +624,7 @@ def main() -> None:
         output = args.output or "results/accuracy_table_quick.csv"
     else:
         datasets = DATASETS
-        seeds = SEEDS
+        seeds = tuple(args.seeds) if args.seeds is not None else SEEDS
         methods = tuple(EXPERIMENTS)
         topgen_kwargs = TOPGEN_KWARGS
         rf_kwargs = RF_KWARGS

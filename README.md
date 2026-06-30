@@ -44,6 +44,7 @@ With all seven representations (`ALL_REP_NAMES`): **56** per class.
 python run_experiments.py --quick    # ~1–2 min smoke test (GunPoint, holdout only)
 python run_experiments.py            # report datasets, 5 seeds, holdout + CV
 python run_experiments.py --no-cv    # same grid but holdout only (skips CV, much faster)
+python run_experiments.py --seeds 0 1 2   # override default seeds (works with --quick / --no-cv)
 ```
 
 ### Methods are feature generators
