@@ -54,7 +54,9 @@ and per-method stage timings (embedding, class clouds, self-densities, cross-per
 Datasets are split into a disjoint `TUNING_DATASETS` set and a reported `REPORT_DATASETS`
 set, and each result row is tagged by UCR `dataset_type` / `is_dynamical` so dynamical
 (premise holds) and non-dynamical (premise does not) datasets can be reported separately.
-RandomForest feature importances are saved per run under `results/feature_importances/`.
+RandomForest feature importances (permutation on the held-out split, TopGen only) are
+appended to `results/feature_importances/feature_importances.csv` — one long-format row
+per feature per run.
 
 Output CSV includes `dataset_type`, `is_dynamical`, `time_fit_s`, `time_predict_s`, and
 `time_detail_json` per row.

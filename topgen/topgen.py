@@ -655,17 +655,27 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
             count += n_reps * n_hom
         return count
 
-    def get_feature_names_out(self, input_features=None):
+    def _feature_rows(self):
         check_is_fitted(self, "classes_")
-        names = []
         for class_label in self.classes_:
             for hom_dim in self.hom_dims:
                 for rep_name in self.rep_names:
                     prefix = f"class_{class_label}_{rep_name}_h{hom_dim}"
+                    meta = {
+                        "class_label": int(class_label),
+                        "rep": rep_name,
+                        "hom_dim": int(hom_dim),
+                    }
                     if "b1" in self.blocks:
-                        names.extend([f"{prefix}_qc", f"{prefix}_cq"])
+                        yield {**meta, "feature": f"{prefix}_qc", "block": "b1"}
+                        yield {**meta, "feature": f"{prefix}_cq", "block": "b1"}
                     if "b2" in self.blocks:
-                        names.append(f"{prefix}_asym")
+                        yield {**meta, "feature": f"{prefix}_asym", "block": "b2"}
                     if "b3" in self.blocks:
-                        names.append(f"{prefix}_membership")
-        return np.asarray(names, dtype=object)
+                        yield {**meta, "feature": f"{prefix}_membership", "block": "b3"}
+
+    def feature_table(self) -> list[dict[str, object]]:
+        return list(self._feature_rows())
+
+    def get_feature_names_out(self, input_features=None):
+        return np.asarray([row["feature"] for row in self._feature_rows()], dtype=object)

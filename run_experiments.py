@@ -16,6 +16,7 @@ from aeon.classification.feature_based import FreshPRINCEClassifier
 from aeon.transformations.collection.feature_based import Catch22
 from sklearn.base import BaseEstimator, ClassifierMixin, TransformerMixin
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.inspection import permutation_importance
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import StratifiedKFold, cross_val_score
 from sklearn.pipeline import FeatureUnion, Pipeline
@@ -92,6 +93,21 @@ CV_FOLDS = 5
 UCR_BASE_URL = "https://timeseriesclassification.com/aeon-toolkit/{name}.zip"
 OUTPUT_CSV = "results/accuracy_table.csv"
 IMPORTANCE_DIR = "results/feature_importances"
+IMPORTANCE_CSV = os.path.join(IMPORTANCE_DIR, "feature_importances.csv")
+IMPORTANCE_FIELDS = (
+    "dataset",
+    "dataset_type",
+    "is_dynamical",
+    "seed",
+    "method",
+    "feature",
+    "class_label",
+    "rep",
+    "hom_dim",
+    "block",
+    "importance",
+    "importance_std",
+)
 
 TOPGEN_KWARGS = dict(
     rep_names=ALL_REP_NAMES,
@@ -294,11 +310,6 @@ class TopGenRFClassifier(BaseEstimator, ClassifierMixin):
         self.rf_.fit(X_train, y)
         self.timings_["rf_fit"] = time.perf_counter() - t0
 
-        # Feature importances aligned with TopGen feature names (Fix 5: confirm
-        # TopGen features are used, not overfit).
-        self.feature_importances_ = self.rf_.feature_importances_
-        self.feature_names_ = list(self.topgen_.get_feature_names_out())
-
         if hasattr(self.topgen_, "fit_timings_"):
             for key, value in self.topgen_.fit_timings_.items():
                 self.timings_[f"topgen_fit_{key}"] = value
@@ -465,7 +476,18 @@ def run_experiments(
         estimator = _method_factory(method_name, seed, topgen_kwargs, rf_kwargs)
         holdout_acc, timings = evaluate_holdout_timed(train_X, train_y, test_X, test_y, estimator)
 
-        save_feature_importances(estimator, dataset, method_name, seed)
+        if method_name == "TopGen" and hasattr(estimator, "topgen_") and hasattr(estimator, "rf_"):
+            save_feature_importances(
+                estimator.rf_,
+                estimator.topgen_,
+                dataset=dataset,
+                seed=seed,
+                dataset_type=DATASET_TYPES.get(dataset, "UNKNOWN"),
+                is_dynamical=is_dynamical(dataset),
+                out_dir=IMPORTANCE_DIR,
+                X_val=estimator.topgen_.transform(test_X),
+                y_val=test_y,
+            )
 
         cv_acc = float("nan")
         if run_cv:
@@ -496,21 +518,65 @@ def run_experiments(
     return rows
 
 
-def save_feature_importances(estimator, dataset: str, method_name: str, seed: int) -> None:
-    """Dump RandomForest importances aligned with TopGen feature names (Fix 5)."""
-    importances = getattr(estimator, "feature_importances_", None)
-    names = getattr(estimator, "feature_names_", None)
-    if importances is None or names is None:
-        return
-    os.makedirs(IMPORTANCE_DIR, exist_ok=True)
-    path = os.path.join(IMPORTANCE_DIR, f"{dataset}_{method_name}_seed{seed}.json")
-    ranked = sorted(
-        ({"feature": n, "importance": float(v)} for n, v in zip(names, importances)),
-        key=lambda item: item["importance"],
-        reverse=True,
-    )
-    with open(path, "w") as handle:
-        json.dump(ranked, handle, indent=2)
+def save_feature_importances(
+    rf,
+    transformer,
+    *,
+    dataset: str,
+    seed: int,
+    dataset_type: str,
+    is_dynamical: bool,
+    out_dir: str,
+    method: str = "permutation",
+    X_val=None,
+    y_val=None,
+) -> None:
+    table = transformer.feature_table()
+    if method == "permutation":
+        if X_val is None or y_val is None:
+            raise ValueError("permutation importance requires X_val and y_val")
+        result = permutation_importance(
+            rf, X_val, y_val, n_repeats=10, random_state=seed, n_jobs=-1
+        )
+        importances = result.importances_mean
+        stds = result.importances_std
+    elif method == "impurity":
+        importances = rf.feature_importances_
+        stds = np.full(len(importances), np.nan)
+    else:
+        raise ValueError(f"Unknown importance method: {method}")
+
+    if len(table) != len(importances):
+        raise ValueError(
+            f"feature table length {len(table)} != importance length {len(importances)}"
+        )
+
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, os.path.basename(IMPORTANCE_CSV))
+    write_header = not os.path.exists(path)
+    rows = []
+    for meta, importance, importance_std in zip(table, importances, stds):
+        rows.append(
+            {
+                "dataset": dataset,
+                "dataset_type": dataset_type,
+                "is_dynamical": is_dynamical,
+                "seed": seed,
+                "method": method,
+                "feature": meta["feature"],
+                "class_label": meta["class_label"],
+                "rep": meta["rep"],
+                "hom_dim": meta["hom_dim"],
+                "block": meta["block"],
+                "importance": float(importance),
+                "importance_std": float(importance_std),
+            }
+        )
+    with open(path, "a", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=IMPORTANCE_FIELDS)
+        if write_header:
+            writer.writeheader()
+        writer.writerows(rows)
 
 
 def summarize_by_type(rows: list[dict[str, object]]) -> None:
