@@ -69,9 +69,10 @@ EXPERIMENTS = {
 }
 ```
 
-`FeatureGeneratorClassifier` builds each generator once, concatenates the matrices, and
-fits the shared classifier — so combining feature sets is just list membership, no extra
-modeling code.
+For each dataset/seed split, the runner first computes every needed generator once
+(`topgen`, `catch22`, `tsfresh`), then a second loop concatenates the requested blocks
+for each experiment and fits the shared classifier. Thus `TopGen`, `TopGen+catch22`,
+and `TopGen+TSFresh` reuse the same TopGen feature matrix for that split.
 
 Full run cost is dominated by **MTopDiv cross-barcodes**, not UCR series length. TopGen's
 fit runs a **leave-one-series-out (LOO)** pass: every train series is scored against every

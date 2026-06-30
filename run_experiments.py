@@ -9,15 +9,16 @@ import json
 import os
 import time
 import zipfile
+from dataclasses import dataclass
 from urllib.request import urlopen
 
 import numpy as np
 from aeon.transformations.collection.feature_based import Catch22, TSFresh
-from sklearn.base import BaseEstimator, ClassifierMixin, TransformerMixin
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.inspection import permutation_importance
 from sklearn.metrics import accuracy_score
-from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
 
 from topgen.features import ALL_REP_NAMES
@@ -164,26 +165,31 @@ def explain_runtime_cost(
     topgen_kwargs: dict,
     n_datasets: int,
     n_seeds: int,
-    n_methods: int,
+    methods: tuple[str, ...],
     run_cv: bool,
 ) -> None:
     """Print cross-barcode budget — dominant cost even on small UCR series."""
     density_repeats = topgen_kwargs.get("density_repeats", 1)
     n_reps = len(topgen_kwargs.get("rep_names", ("mtd",)))
+    generators = _unique_generators(methods)
+    n_methods = len(methods)
     # LOO fit: every train series is scored vs every class (2 cross-barcodes each);
     # in-class density repeats add (R-1) more query-on-left barcodes per series.
     fit_xbarc = n_train * n_classes * 2 + n_train * max(density_repeats - 1, 0)
     test_xbarc = n_test * n_classes * 2
     per_holdout = fit_xbarc + test_xbarc
     cv_multiplier = 1 + CV_FOLDS if run_cv else 1
-    grid = n_datasets * n_seeds * n_methods * cv_multiplier
+    feature_splits = n_datasets * n_seeds * cv_multiplier
+    classifier_fits = feature_splits * n_methods
+    topgen_passes = feature_splits if "topgen" in generators else 0
     print(
         "Runtime is dominated by GPU cross-barcodes (MTopDiv), not dataset size.\n"
         f"  Per TopGen holdout (this split): ~{per_holdout} cross-barcodes "
         f"({fit_xbarc} LOO fit + {test_xbarc} test),\n"
         f"  {n_reps} linear reps each reuse the same barcode.\n"
-        f"  Full grid: {n_datasets} datasets × {n_seeds} seeds × {n_methods} methods "
-        f"× {cv_multiplier} (holdout{' + CV' if run_cv else ''}) = {grid} estimator fits.\n"
+        f"  Feature generators per split: {', '.join(generators)}.\n"
+        f"  TopGen feature passes after reuse: {topgen_passes}; "
+        f"classifier fits: {classifier_fits}.\n"
         "  Use --quick for a ~1–2 min smoke test."
     )
 
@@ -303,109 +309,212 @@ def make_classifier(random_state, rf_kwargs):
     return RandomForestClassifier(random_state=random_state, **rf_kwargs)
 
 
-class FeatureGeneratorClassifier(BaseEstimator, ClassifierMixin):
-    """Concatenate one or more TS feature generators, then a single shared classifier."""
-
-    def __init__(self, generators=("topgen",), random_state=0, topgen_kwargs=None, rf_kwargs=None):
-        self.generators = generators
-        self.random_state = random_state
-        self.topgen_kwargs = topgen_kwargs
-        self.rf_kwargs = rf_kwargs
-        self.timings_: dict[str, float] = {}
-
-    def fit(self, X, y):
-        y = np.asarray(y)
-        t0 = time.perf_counter()
-        topgen_kwargs = TOPGEN_KWARGS if self.topgen_kwargs is None else self.topgen_kwargs
-        rf_kwargs = RF_KWARGS if self.rf_kwargs is None else self.rf_kwargs
-
-        self.generators_ = [make_generator(n, self.random_state, topgen_kwargs) for n in self.generators]
-        blocks, records = [], []
-        for gen in self.generators_:
-            blocks.append(gen.fit_transform(X, y))
-            records += gen.records()
-        self.feature_records_ = records
-
-        self.clf_ = make_classifier(self.random_state, rf_kwargs)
-        self.clf_.fit(np.hstack(blocks), y)
-        self.classes_ = self.clf_.classes_
-        self.timings_["fit_total"] = time.perf_counter() - t0
-        self._merge_topgen_timings("fit_timings_", "topgen_fit")
-        return self
-
-    def predict(self, X):
-        t0 = time.perf_counter()
-        blocks = [gen.transform(X) for gen in self.generators_]
-        self.last_test_features_ = np.hstack(blocks)
-        y_pred = self.clf_.predict(self.last_test_features_)
-        self.timings_["predict_total"] = time.perf_counter() - t0
-        self._merge_topgen_timings("transform_timings_", "topgen_transform")
-        return y_pred
-
-    def _merge_topgen_timings(self, attr, prefix):
-        for gen in self.generators_:
-            timings = getattr(getattr(gen, "transformer", None), attr, None)
-            if timings:
-                for key, value in timings.items():
-                    self.timings_[f"{prefix}_{key}"] = value
-
-
 # --- evaluation --------------------------------------------------------------
 
 
-def _method_factory(
-    method_name: str,
-    seed: int,
-    topgen_kwargs: dict,
-    rf_kwargs: dict,
-):
-    if method_name not in EXPERIMENTS:
-        raise ValueError(f"Unknown method: {method_name}")
-    return FeatureGeneratorClassifier(EXPERIMENTS[method_name], seed, topgen_kwargs, rf_kwargs)
+@dataclass
+class FeatureBlock:
+    train: np.ndarray
+    eval: np.ndarray
+    records: list[dict[str, object]]
+    timings: dict[str, float]
 
 
-def evaluate_holdout_timed(
+def _unique_generators(methods: tuple[str, ...]) -> tuple[str, ...]:
+    """Generators needed by these methods, in first-use order."""
+    names: list[str] = []
+    for method in methods:
+        if method not in EXPERIMENTS:
+            raise ValueError(f"Unknown method: {method}")
+        for name in EXPERIMENTS[method]:
+            if name not in names:
+                names.append(name)
+    return tuple(names)
+
+
+def _as_feature_matrix(matrix, name: str, split: str) -> np.ndarray:
+    matrix = np.asarray(matrix, dtype=float)
+    if matrix.ndim != 2:
+        raise ValueError(f"{name} produced a {matrix.ndim}D {split} matrix; expected 2D")
+    return matrix
+
+
+def _generator_timings(name: str, generator, fit_elapsed: float, transform_elapsed: float) -> dict[str, float]:
+    timings = {
+        f"{name}_fit_elapsed": fit_elapsed,
+        f"{name}_transform_elapsed": transform_elapsed,
+        f"{name}_elapsed": fit_elapsed + transform_elapsed,
+    }
+    transformer = getattr(generator, "transformer", None)
+    for attr, prefix in (("fit_timings_", "fit"), ("transform_timings_", "transform")):
+        for key, value in getattr(transformer, attr, {}).items():
+            timings[f"{name}_{prefix}_{key}"] = float(value)
+    return timings
+
+
+def compute_feature_blocks(
+    generator_names: tuple[str, ...],
     X_train: np.ndarray,
     y_train: np.ndarray,
-    X_test: np.ndarray,
-    y_test: np.ndarray,
-    estimator,
-) -> tuple[float, dict[str, float]]:
+    X_eval: np.ndarray,
+    seed: int,
+    topgen_kwargs: dict,
+) -> dict[str, FeatureBlock]:
+    """First cycle: fit each requested generator once and keep its train/eval blocks."""
+    blocks: dict[str, FeatureBlock] = {}
+    for name in generator_names:
+        generator = make_generator(name, seed, topgen_kwargs)
+
+        t0 = time.perf_counter()
+        train_block = _as_feature_matrix(generator.fit_transform(X_train, y_train), name, "train")
+        fit_elapsed = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        eval_block = _as_feature_matrix(generator.transform(X_eval), name, "eval")
+        transform_elapsed = time.perf_counter() - t0
+
+        records = generator.records()
+        if len(records) != train_block.shape[1]:
+            raise ValueError(
+                f"{name} records ({len(records)}) do not match feature columns "
+                f"({train_block.shape[1]})"
+            )
+
+        blocks[name] = FeatureBlock(
+            train=train_block,
+            eval=eval_block,
+            records=records,
+            timings=_generator_timings(name, generator, fit_elapsed, transform_elapsed),
+        )
+        print(f"    {name:7s} features: train {train_block.shape}, eval {eval_block.shape}")
+    return blocks
+
+
+def combine_method_features(
+    method_name: str,
+    feature_blocks: dict[str, FeatureBlock],
+) -> tuple[np.ndarray, np.ndarray, list[dict[str, object]]]:
+    """Second cycle input: concatenate already-computed blocks for one method."""
+    generator_names = EXPERIMENTS[method_name]
+    train_parts = [feature_blocks[name].train for name in generator_names]
+    eval_parts = [feature_blocks[name].eval for name in generator_names]
+    records: list[dict[str, object]] = []
+    for name in generator_names:
+        records.extend(feature_blocks[name].records)
+    train = train_parts[0] if len(train_parts) == 1 else np.hstack(train_parts)
+    eval_matrix = eval_parts[0] if len(eval_parts) == 1 else np.hstack(eval_parts)
+    return train, eval_matrix, records
+
+
+def _feature_timings_for_method(
+    method_name: str,
+    feature_blocks: dict[str, FeatureBlock],
+) -> dict[str, float]:
     timings: dict[str, float] = {}
-    t0 = time.perf_counter()
-    estimator.fit(X_train, y_train)
-    timings["fit_total"] = time.perf_counter() - t0
+    feature_fit = 0.0
+    feature_transform = 0.0
+    for name in EXPERIMENTS[method_name]:
+        block_timings = feature_blocks[name].timings
+        feature_fit += block_timings[f"{name}_fit_elapsed"]
+        feature_transform += block_timings[f"{name}_transform_elapsed"]
+        timings.update(block_timings)
+    timings["feature_fit_total"] = feature_fit
+    timings["feature_transform_total"] = feature_transform
+    timings["feature_total"] = feature_fit + feature_transform
+    timings["features_reused"] = 1.0
+    return timings
+
+
+def fit_predict_from_features(
+    X_train_features: np.ndarray,
+    y_train: np.ndarray,
+    X_eval_features: np.ndarray,
+    y_eval: np.ndarray,
+    seed: int,
+    rf_kwargs: dict,
+    feature_timings: dict[str, float] | None = None,
+) -> tuple[float, RandomForestClassifier, dict[str, float]]:
+    """Train the shared classifier on precomputed features and score an eval split."""
+    timings = dict(feature_timings or {})
 
     t0 = time.perf_counter()
-    y_pred = estimator.predict(X_test)
-    timings["predict_total"] = time.perf_counter() - t0
+    clf = make_classifier(seed, rf_kwargs)
+    clf.fit(X_train_features, y_train)
+    classifier_fit = time.perf_counter() - t0
 
-    if hasattr(estimator, "timings_"):
-        timings.update(estimator.timings_)
+    t0 = time.perf_counter()
+    y_pred = clf.predict(X_eval_features)
+    classifier_predict = time.perf_counter() - t0
+
+    feature_fit = timings.get("feature_fit_total", 0.0)
+    feature_transform = timings.get("feature_transform_total", 0.0)
+    timings["classifier_fit"] = classifier_fit
+    timings["classifier_predict"] = classifier_predict
+    timings["classifier_total"] = classifier_fit + classifier_predict
+    timings["fit_total"] = feature_fit + classifier_fit
+    timings["predict_total"] = feature_transform + classifier_predict
     timings["total"] = timings["fit_total"] + timings["predict_total"]
-    return float(accuracy_score(y_test, y_pred)), timings
+    return float(accuracy_score(y_eval, y_pred)), clf, timings
 
 
-def evaluate_cv(X: np.ndarray, y: np.ndarray, estimator, seed: int) -> float:
+def evaluate_cv_reused(
+    X: np.ndarray,
+    y: np.ndarray,
+    seed: int,
+    methods: tuple[str, ...],
+    generator_names: tuple[str, ...],
+    topgen_kwargs: dict,
+    rf_kwargs: dict,
+) -> dict[str, float]:
+    """Manual CV so each fold computes every generator once, then reuses blocks."""
+    scores = {method: [] for method in methods}
     cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=seed)
-    scores = cross_val_score(estimator, X, y, cv=cv, scoring="accuracy", n_jobs=1)
-    return float(np.mean(scores))
+    for fold_idx, (train_idx, eval_idx) in enumerate(cv.split(X, y), start=1):
+        print(f"    CV fold {fold_idx}/{CV_FOLDS}: computing feature generators once")
+        fold_blocks = compute_feature_blocks(
+            generator_names,
+            X[train_idx],
+            y[train_idx],
+            X[eval_idx],
+            seed,
+            topgen_kwargs,
+        )
+        for method_name in methods:
+            X_train_features, X_eval_features, _ = combine_method_features(method_name, fold_blocks)
+            acc, _, _ = fit_predict_from_features(
+                X_train_features,
+                y[train_idx],
+                X_eval_features,
+                y[eval_idx],
+                seed,
+                rf_kwargs,
+            )
+            scores[method_name].append(acc)
+    return {method: float(np.mean(method_scores)) for method, method_scores in scores.items()}
 
 
 def _format_timings(timings: dict[str, float]) -> str:
     parts = []
     for key in (
+        "feature_fit_total",
         "fit_total",
         "topgen_fit_class_clouds",
-        "topgen_fit_self_densities",
         "topgen_fit_cross_persistence",
+        "topgen_fit_self_densities",
+        "feature_transform_total",
         "topgen_transform_cross_persistence",
+        "classifier_fit",
+        "classifier_predict",
         "predict_total",
         "total",
     ):
         if key in timings:
             parts.append(f"{key}={timings[key]:.1f}s")
     return "  ".join(parts)
+
+
+def _format_cv_acc(cv_acc: float) -> str:
+    return f"  cv={cv_acc:.4f}" if not np.isnan(cv_acc) else ""
 
 
 def run_experiments(
@@ -418,67 +527,83 @@ def run_experiments(
     output_csv: str | None = None,
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
-    jobs = [(dataset, seed, method) for dataset in datasets for seed in seeds for method in methods]
     data_cache: dict[str, tuple[np.ndarray, ...]] = {}
+    generator_names = _unique_generators(methods)
+    split_jobs = [(dataset, seed) for dataset in datasets for seed in seeds]
+    last_dataset = None
 
-    for dataset, seed, method_name in tqdm(jobs, desc="experiments", unit="job"):
+    for dataset, seed in tqdm(split_jobs, desc="splits", unit="split"):
         if dataset not in data_cache:
             data_cache[dataset] = load_ucr(dataset)
         train_X, train_y, test_X, test_y = data_cache[dataset]
-        X_all = np.vstack([train_X, test_X])
-        y_all = np.concatenate([train_y, test_y])
         n_classes = len(np.unique(train_y))
 
-        if len(rows) == 0 or rows[-1]["dataset"] != dataset:
+        if dataset != last_dataset:
             print(f"\n{dataset}: train {train_X.shape}, test {test_X.shape}, classes={n_classes}")
+            last_dataset = dataset
 
-        estimator = _method_factory(method_name, seed, topgen_kwargs, rf_kwargs)
-        holdout_acc, timings = evaluate_holdout_timed(train_X, train_y, test_X, test_y, estimator)
+        print(f"  seed={seed}: computing feature generators once ({', '.join(generator_names)})")
+        feature_blocks = compute_feature_blocks(
+            generator_names, train_X, train_y, test_X, seed, topgen_kwargs
+        )
 
-        if (
-            hasattr(estimator, "feature_records_")
-            and hasattr(estimator, "clf_")
-            and hasattr(estimator, "last_test_features_")
-        ):
+        cv_accs = {method_name: float("nan") for method_name in methods}
+        if run_cv:
+            X_all = np.vstack([train_X, test_X])
+            y_all = np.concatenate([train_y, test_y])
+            cv_accs = evaluate_cv_reused(
+                X_all, y_all, seed, methods, generator_names, topgen_kwargs, rf_kwargs
+            )
+
+        for method_name in methods:
+            X_train_features, X_test_features, feature_records = combine_method_features(
+                method_name, feature_blocks
+            )
+            holdout_acc, clf, timings = fit_predict_from_features(
+                X_train_features,
+                train_y,
+                X_test_features,
+                test_y,
+                seed,
+                rf_kwargs,
+                _feature_timings_for_method(method_name, feature_blocks),
+            )
+
             save_feature_importances(
-                estimator.clf_,
-                estimator.feature_records_,
+                clf,
+                feature_records,
                 dataset=dataset,
                 seed=seed,
                 dataset_type=DATASET_TYPES.get(dataset, "UNKNOWN"),
                 is_dynamical=is_dynamical(dataset),
                 experiment=method_name,
                 out_dir=IMPORTANCE_DIR,
-                X_val=estimator.last_test_features_,
+                X_val=X_test_features,
                 y_val=test_y,
             )
 
-        cv_acc = float("nan")
-        if run_cv:
-            cv_estimator = _method_factory(method_name, seed, topgen_kwargs, rf_kwargs)
-            cv_acc = evaluate_cv(X_all, y_all, cv_estimator, seed)
-
-        row = {
-            "dataset": dataset,
-            "dataset_type": DATASET_TYPES.get(dataset, "UNKNOWN"),
-            "is_dynamical": is_dynamical(dataset),
-            "method": method_name,
-            "seed": seed,
-            "holdout_accuracy": holdout_acc,
-            "cv_accuracy": cv_acc,
-            "time_total_s": round(timings.get("total", 0.0), 2),
-            "time_fit_s": round(timings.get("fit_total", 0.0), 2),
-            "time_predict_s": round(timings.get("predict_total", 0.0), 2),
-            "time_detail_json": json.dumps({k: round(v, 3) for k, v in sorted(timings.items())}),
-        }
-        rows.append(row)
-        print(
-            f"  {method_name:16s} seed={seed}  holdout={holdout_acc:.4f}"
-            + (f"  cv={cv_acc:.4f}" if run_cv else "")
-            + f"  {_format_timings(timings)}"
-        )
-        if output_csv is not None:
-            write_csv(rows, output_csv, quiet=True)
+            cv_acc = cv_accs[method_name]
+            row = {
+                "dataset": dataset,
+                "dataset_type": DATASET_TYPES.get(dataset, "UNKNOWN"),
+                "is_dynamical": is_dynamical(dataset),
+                "method": method_name,
+                "seed": seed,
+                "holdout_accuracy": holdout_acc,
+                "cv_accuracy": cv_acc,
+                "time_total_s": round(timings.get("total", 0.0), 2),
+                "time_fit_s": round(timings.get("fit_total", 0.0), 2),
+                "time_predict_s": round(timings.get("predict_total", 0.0), 2),
+                "time_detail_json": json.dumps({k: round(v, 3) for k, v in sorted(timings.items())}),
+            }
+            rows.append(row)
+            print(
+                f"  {method_name:16s} seed={seed}  holdout={holdout_acc:.4f}"
+                + _format_cv_acc(cv_acc)
+                + f"  {_format_timings(timings)}"
+            )
+            if output_csv is not None:
+                write_csv(rows, output_csv, quiet=True)
     return rows
 
 
@@ -639,7 +764,7 @@ def main() -> None:
         topgen_kwargs=topgen_kwargs,
         n_datasets=len(datasets),
         n_seeds=len(seeds),
-        n_methods=len(methods),
+        methods=methods,
         run_cv=run_cv,
     )
 
