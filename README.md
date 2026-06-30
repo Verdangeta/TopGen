@@ -42,7 +42,8 @@ With all seven representations (`ALL_REP_NAMES`): **56** per class.
 
 ```bash
 python run_experiments.py --quick    # ~1–2 min smoke test (GunPoint, holdout only)
-python run_experiments.py            # report datasets, 5 seeds (slow: many GPU cross-barcode fits)
+python run_experiments.py            # report datasets, 5 seeds, holdout + CV
+python run_experiments.py --no-cv    # same grid but holdout only (skips CV, much faster)
 ```
 
 ### Methods are feature generators

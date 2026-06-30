@@ -599,6 +599,11 @@ def main() -> None:
         default=None,
         help="CSV output path (default: results/accuracy_table_quick.csv or accuracy_table.csv)",
     )
+    parser.add_argument(
+        "--no-cv",
+        action="store_true",
+        help="Skip cross-validation; run the train/test holdout split only (faster).",
+    )
     args = parser.parse_args()
 
     if args.quick:
@@ -615,7 +620,7 @@ def main() -> None:
         methods = tuple(EXPERIMENTS)
         topgen_kwargs = TOPGEN_KWARGS
         rf_kwargs = RF_KWARGS
-        run_cv = True
+        run_cv = not args.no_cv
         output = args.output or OUTPUT_CSV
 
     train_X, train_y, test_X, test_y = load_ucr(datasets[0])
