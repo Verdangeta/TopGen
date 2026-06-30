@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
+import tempfile
 from dataclasses import dataclass
 
 import mtd
@@ -36,14 +39,89 @@ class FrozenDensity:
     sorted_values: np.ndarray
 
 
-def cross_barcode(
+def _digest_cloud(hasher: "hashlib._Hash", cloud: np.ndarray) -> None:
+    """Fold one point cloud into a content hash (bytes + shape + dtype)."""
+    arr = np.ascontiguousarray(np.asarray(cloud, dtype=float))
+    hasher.update(repr(arr.shape).encode())
+    hasher.update(repr(arr.dtype).encode())
+    hasher.update(arr.tobytes())
+
+
+def barcode_cache_key(
     left: np.ndarray,
     right: np.ndarray,
     batch_size_left: int,
     batch_size_right: int,
-    pdist_device: str = "cuda",
-) -> np.ndarray:
-    """Wrap MTopDiv cross-barcode computation (same convention as Topological_classifier)."""
+    pdist_device: str,
+) -> str:
+    """Content-addressed key from both clouds and MTopDiv batch/device args."""
+    hasher = hashlib.sha256()
+    _digest_cloud(hasher, left)
+    _digest_cloud(hasher, right)
+    hasher.update(repr(int(batch_size_left)).encode())
+    hasher.update(repr(int(batch_size_right)).encode())
+    hasher.update(pdist_device.encode())
+    return hasher.hexdigest()
+
+
+def _barcode_cache_path(cache_dir: str, key: str) -> str:
+    return os.path.join(cache_dir, f"{key}.npz")
+
+
+def _barcode_to_npz_arrays(barcode) -> dict[str, np.ndarray]:
+    """Serialize H0/H1 birth–death arrays for disk storage."""
+    arrays: dict[str, np.ndarray] = {}
+    for hom_dim, bars in enumerate(barcode):
+        bars = np.asarray(bars, dtype=float)
+        if bars.size == 0:
+            arrays[f"h{hom_dim}"] = np.empty((0, 2), dtype=float)
+        else:
+            arrays[f"h{hom_dim}"] = bars.reshape(-1, 2)
+    arrays["n_hom"] = np.array([len(barcode)], dtype=np.int32)
+    return arrays
+
+
+def _barcode_from_npz(payload) -> list[np.ndarray]:
+    """Reconstruct the list-of-homology-dims structure MTopDiv returns."""
+    n_hom = int(np.asarray(payload["n_hom"]).ravel()[0])
+    return [np.asarray(payload[f"h{hom_dim}"], dtype=float) for hom_dim in range(n_hom)]
+
+
+def _load_barcode_cache(cache_path: str):
+    if not os.path.isfile(cache_path):
+        return None
+    try:
+        with np.load(cache_path, allow_pickle=False) as payload:
+            return _barcode_from_npz(payload)
+    except (OSError, ValueError, KeyError, EOFError):
+        return None
+
+
+def _save_barcode_cache(cache_path: str, barcode) -> None:
+    """Atomic write: temp file in cache dir, then os.replace."""
+    cache_dir = os.path.dirname(cache_path)
+    os.makedirs(cache_dir, exist_ok=True)
+    fd, tmp_base = tempfile.mkstemp(dir=cache_dir)
+    os.close(fd)
+    os.unlink(tmp_base)
+    tmp_path = f"{tmp_base}.npz"
+    try:
+        np.savez_compressed(tmp_base, **_barcode_to_npz_arrays(barcode))
+        os.replace(tmp_path, cache_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
+def _compute_cross_barcode(
+    left: np.ndarray,
+    right: np.ndarray,
+    batch_size_left: int,
+    batch_size_right: int,
+    pdist_device: str,
+):
+    """Raw MTopDiv cross-barcode (same convention as Topological_classifier)."""
     return mtd.calc_cross_barcodes(
         left,
         right,
@@ -52,6 +130,38 @@ def cross_barcode(
         pdist_device=pdist_device,
         is_plot=False,
     )
+
+
+def cross_barcode(
+    left: np.ndarray,
+    right: np.ndarray,
+    batch_size_left: int,
+    batch_size_right: int,
+    pdist_device: str = "cuda",
+    cache_dir: str | None = None,
+) -> np.ndarray:
+    """Wrap MTopDiv cross-barcode computation with optional content-addressed cache.
+
+    When ``cache_dir`` is set, barcodes are keyed by the raw left/right point
+    clouds (plus batch sizes and device). Different ``random_state`` values that
+    produce different clouds automatically get different keys.
+    """
+    if cache_dir is None:
+        return _compute_cross_barcode(
+            left, right, batch_size_left, batch_size_right, pdist_device
+        )
+
+    key = barcode_cache_key(left, right, batch_size_left, batch_size_right, pdist_device)
+    cache_path = _barcode_cache_path(cache_dir, key)
+    cached = _load_barcode_cache(cache_path)
+    if cached is not None:
+        return cached
+
+    barcode = _compute_cross_barcode(
+        left, right, batch_size_left, batch_size_right, pdist_device
+    )
+    _save_barcode_cache(cache_path, barcode)
+    return barcode
 
 
 def _homology_bars(barcode: np.ndarray, hom_dim: int) -> np.ndarray:
@@ -242,10 +352,15 @@ def feature_blocks(
     pdist_device: str = "cuda",
     density_estimator: str = "kde",
     betti_thresholds: dict[int, np.ndarray] | None = None,
+    cache_dir: str | None = None,
 ) -> np.ndarray:
     """Compute both-order cross-barcodes for a query/class pair, then assemble blocks."""
-    barcode_qc = cross_barcode(query_cloud, class_subcloud, query_size, class_size, pdist_device)
-    barcode_cq = cross_barcode(class_subcloud, query_cloud, class_size, query_size, pdist_device)
+    barcode_qc = cross_barcode(
+        query_cloud, class_subcloud, query_size, class_size, pdist_device, cache_dir=cache_dir
+    )
+    barcode_cq = cross_barcode(
+        class_subcloud, query_cloud, class_size, query_size, pdist_device, cache_dir=cache_dir
+    )
     return assemble_blocks(
         barcode_qc,
         barcode_cq,

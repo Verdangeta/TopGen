@@ -81,6 +81,12 @@ all points are used** — no fraction downsampling. Otherwise:
 Set `debug_sizes=True` on `TopGenTransformer` to print resolved cloud shapes and
 cross-barcode batch sizes during fit (first LOO row) and transform (first test row).
 
+Optional **barcode disk cache** (content-addressed on raw left/right point clouds):
+set `cache_dir="/path/to/cache"` on `TopGenTransformer`. Only raw H0/H1 barcodes are
+cached (`.npz` per key); `rep_names`, blocks, and Betti thresholds stay outside the
+cache so ablation grids reuse the same MTopDiv results. Default `cache_dir=None` disables
+caching.
+
 The same per-class right size `M'` is used for self-density, train (LOO), and test, so sizes
 stay matched (methodology §8). The right (class) cloud is deterministic per class, so
 identical input series produce identical features.

@@ -133,6 +133,7 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
         random_state: int = 42,
         record_timing: bool = False,
         debug_sizes: bool = False,
+        cache_dir: str | None = None,
     ):
         self.vectorizer = vectorizer
         self.embedding_dimension = embedding_dimension
@@ -164,6 +165,7 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
         self.random_state = random_state
         self.record_timing = record_timing
         self.debug_sizes = debug_sizes
+        self.cache_dir = cache_dir
 
     def fit(self, X, y):
         """Leave-one-series-out pass: builds class clouds, freezes self-densities,
@@ -263,6 +265,7 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
                         bc_qc_r = cross_barcode(
                             query_cloud, right_r, query_cloud.shape[0], right_r.shape[0],
                             self.pdist_device,
+                            cache_dir=self.cache_dir,
                         )
                         extra_qc.append((class_label, bc_qc_r))
                         for hom_dim in self.hom_dims:
@@ -387,6 +390,7 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
                         pdist_device=self.pdist_device,
                         density_estimator=self.density_estimator,
                         betti_thresholds=self.betti_thresholds_,
+                        cache_dir=self.cache_dir,
                     )
                 )
                 cross_persistence_time += time.perf_counter() - t0
@@ -448,10 +452,12 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
     def _both_orders(self, query_cloud: np.ndarray, right: np.ndarray) -> tuple:
         """Cross-barcodes in both query/class orders."""
         bc_qc = cross_barcode(
-            query_cloud, right, query_cloud.shape[0], right.shape[0], self.pdist_device
+            query_cloud, right, query_cloud.shape[0], right.shape[0],
+            self.pdist_device, cache_dir=self.cache_dir,
         )
         bc_cq = cross_barcode(
-            right, query_cloud, right.shape[0], query_cloud.shape[0], self.pdist_device
+            right, query_cloud, right.shape[0], query_cloud.shape[0],
+            self.pdist_device, cache_dir=self.cache_dir,
         )
         return bc_qc, bc_cq
 
