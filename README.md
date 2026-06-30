@@ -45,22 +45,45 @@ python run_experiments.py --quick    # ~1–2 min smoke test (GunPoint, holdout 
 python run_experiments.py            # report datasets, 5 seeds (slow: many GPU cross-barcode fits)
 ```
 
-Full run cost is dominated by **MTopDiv cross-barcodes**, not UCR series length. Fit runs
-a **leave-one-series-out (LOO)** pass: every train series is scored against every class
-(2 cross-barcodes each), which simultaneously yields the frozen self-densities and the
+### Methods are feature generators
+
+Every method is just a **time-series feature generator**; the classifier is a separate,
+shared choice (RandomForest for now — see `make_classifier`). An *experiment* is simply
+which generators to concatenate before that one classifier:
+
+| generator | features |
+| --- | --- |
+| `topgen`  | TopGen population-level cross-persistence (leakage-free LOO on train) |
+| `catch22` | aeon catch22 |
+| `tsfresh` | aeon TSFresh (the FreshPRINCE feature set, efficient profile) |
+
+```python
+EXPERIMENTS = {
+    "TopGen":         ("topgen",),
+    "catch22":        ("catch22",),
+    "TSFresh":        ("tsfresh",),
+    "TopGen+catch22": ("topgen", "catch22"),
+    "TopGen+TSFresh": ("topgen", "tsfresh"),
+}
+```
+
+`FeatureGeneratorClassifier` builds each generator once, concatenates the matrices, and
+fits the shared classifier — so combining feature sets is just list membership, no extra
+modeling code.
+
+Full run cost is dominated by **MTopDiv cross-barcodes**, not UCR series length. TopGen's
+fit runs a **leave-one-series-out (LOO)** pass: every train series is scored against every
+class (2 cross-barcodes each), which simultaneously yields the frozen self-densities and the
 leakage-free train features. The runner prints a cross-barcode budget estimate at startup
-and per-method stage timings (embedding, class clouds, self-densities, cross-persistence, RF).
+and per-method stage timings (embedding, class clouds, self-densities, cross-persistence, classifier).
 
 Datasets are split into a disjoint `TUNING_DATASETS` set and a reported `REPORT_DATASETS`
 set, and each result row is tagged by UCR `dataset_type` / `is_dynamical` so dynamical
 (premise holds) and non-dynamical (premise does not) datasets can be reported separately.
-RandomForest feature importances (permutation on the held-out split) are appended to
+Feature importances (permutation on the held-out split) are appended to
 `results/feature_importances/feature_importances.csv` — one long-format row per feature
-per run. They are exported for every TopGen-containing method (`TopGen`, `TopGen+catch22`,
-`TopGen+FreshPRINCE`): each combined method computes TopGen + addon features once,
-concatenates them, and fits one forest, so each row is tagged with `experiment` and a
-`source` (`topgen` / `catch22` / `tsfresh`) to compare whether TopGen features carry
-signal next to the baselines.
+per run, tagged with `experiment` and `source` (`topgen` / `catch22` / `tsfresh`) so you
+can ask whether TopGen features keep signal next to the baselines.
 
 Output CSV includes `dataset_type`, `is_dynamical`, `time_fit_s`, `time_predict_s`, and
 `time_detail_json` per row.

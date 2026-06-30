@@ -12,7 +12,6 @@ import zipfile
 from urllib.request import urlopen
 
 import numpy as np
-from aeon.classification.feature_based import FreshPRINCEClassifier
 from aeon.transformations.collection.feature_based import Catch22, TSFresh
 from sklearn.base import BaseEstimator, ClassifierMixin, TransformerMixin
 from sklearn.ensemble import RandomForestClassifier
@@ -132,10 +131,18 @@ TOPGEN_KWARGS = dict(
     record_timing=True,
 )
 
+# Shared classifier on top of the concatenated feature generators. The model is just
+# a choice (RF for now); swap RF_KWARGS / make_classifier for e.g. RotationForest later.
 RF_KWARGS = dict(n_estimators=200, n_jobs=-1)
 
-# Independent baseline: whole-series TSFresh → RotationForest (not used inside TopGen clouds).
-FRESHPRINCE_KWARGS = dict(default_fc_parameters="efficient", verbose=0)
+# An experiment = which feature generators to concatenate before the shared classifier.
+EXPERIMENTS = {
+    "TopGen": ("topgen",),
+    "catch22": ("catch22",),
+    "TSFresh": ("tsfresh",),
+    "TopGen+catch22": ("topgen", "catch22"),
+    "TopGen+TSFresh": ("topgen", "tsfresh"),
+}
 
 QUICK_DATASETS = ("GunPoint",)
 QUICK_SEEDS = (0,)
@@ -226,186 +233,121 @@ class UnivariateToCollection(TransformerMixin, BaseEstimator):
         return X
 
 
-class AeonCatch22Pipeline(BaseEstimator, ClassifierMixin):
-    """catch22 features + random forest baseline."""
-
-    def __init__(self, random_state: int = 0, rf_kwargs: dict | None = None):
-        self.random_state = random_state
-        self.rf_kwargs = RF_KWARGS if rf_kwargs is None else rf_kwargs
-
-    def fit(self, X, y):
-        self.pipeline_ = Pipeline(
-            [
-                ("reshape", UnivariateToCollection()),
-                ("catch22", Catch22()),
-                ("rf", RandomForestClassifier(random_state=self.random_state, **self.rf_kwargs)),
-            ]
-        )
-        self.pipeline_.fit(X, y)
-        self.classes_ = self.pipeline_.named_steps["rf"].classes_
-        return self
-
-    def predict(self, X):
-        return self.pipeline_.predict(X)
-
-
-class FreshPRINCEBaseline(BaseEstimator, ClassifierMixin):
-    """Whole-series TSFresh features + RotationForest (aeon), independent of TopGen."""
-
-    def __init__(
-        self,
-        random_state: int = 0,
-        rf_kwargs: dict | None = None,
-        freshprince_kwargs: dict | None = None,
-    ):
-        self.random_state = random_state
-        self.rf_kwargs = RF_KWARGS if rf_kwargs is None else rf_kwargs
-        self.freshprince_kwargs = FRESHPRINCE_KWARGS if freshprince_kwargs is None else freshprince_kwargs
-
-    def fit(self, X, y):
-        self.estimator_ = FreshPRINCEClassifier(
-            n_estimators=self.rf_kwargs["n_estimators"],
-            random_state=self.random_state,
-            n_jobs=self.rf_kwargs["n_jobs"],
-            **self.freshprince_kwargs,
-        )
-        X = np.asarray(X, dtype=float)
-        if X.ndim == 2:
-            X = X[:, np.newaxis, :]
-        self.estimator_.fit(X, y)
-        self.classes_ = self.estimator_.classes_
-        return self
-
-    def predict(self, X):
-        X = np.asarray(X, dtype=float)
-        if X.ndim == 2:
-            X = X[:, np.newaxis, :]
-        return self.estimator_.predict(X)
-
-
-class TopGenRFClassifier(BaseEstimator, ClassifierMixin):
-    """TopGen features + random forest with staged timing."""
-
-    def __init__(
-        self,
-        random_state: int = 0,
-        topgen_kwargs: dict | None = None,
-        rf_kwargs: dict | None = None,
-    ):
-        self.random_state = random_state
-        self.topgen_kwargs = TOPGEN_KWARGS if topgen_kwargs is None else topgen_kwargs
-        self.rf_kwargs = RF_KWARGS if rf_kwargs is None else rf_kwargs
-        self.timings_: dict[str, float] = {}
-
-    def fit(self, X, y):
-        y = np.asarray(y)
-        total_start = time.perf_counter()
-
-        self.topgen_ = TopGenTransformer(random_state=self.random_state, **self.topgen_kwargs)
-        # Single LOO pass: fit_transform returns the cached leakage-free train matrix.
-        t0 = time.perf_counter()
-        X_train = self.topgen_.fit_transform(X, y)
-        self.timings_["topgen_fit"] = time.perf_counter() - t0
-
-        t0 = time.perf_counter()
-        self.rf_ = RandomForestClassifier(random_state=self.random_state, **self.rf_kwargs)
-        self.rf_.fit(X_train, y)
-        self.timings_["rf_fit"] = time.perf_counter() - t0
-
-        self.feature_records_ = _topgen_records(self.topgen_)
-
-        if hasattr(self.topgen_, "fit_timings_"):
-            for key, value in self.topgen_.fit_timings_.items():
-                self.timings_[f"topgen_fit_{key}"] = value
-
-        self.timings_["fit_total"] = time.perf_counter() - total_start
-        self.classes_ = self.rf_.classes_
-        return self
-
-    def predict(self, X):
-        predict_start = time.perf_counter()
-        t0 = time.perf_counter()
-        X_test = self.topgen_.transform(X)
-        self.last_test_features_ = X_test
-        self.timings_["topgen_transform_test"] = time.perf_counter() - t0
-
-        t0 = time.perf_counter()
-        y_pred = self.rf_.predict(X_test)
-        self.timings_["rf_predict"] = time.perf_counter() - t0
-
-        if hasattr(self.topgen_, "transform_timings_"):
-            for key, value in self.topgen_.transform_timings_.items():
-                self.timings_[f"topgen_transform_test_{key}"] = value
-
-        self.timings_["predict_total"] = time.perf_counter() - predict_start
-        return y_pred
-
-
-def _topgen_records(transformer):
-    return [{**r, "source": "topgen"} for r in transformer.feature_table()]
-
-
-def _addon_records(source, n_features):
-    return [
-        {"feature": f"{source}_{i}", "source": source,
-         "class_label": "", "rep": "", "hom_dim": "", "block": ""}
-        for i in range(n_features)
-    ]
-
-
-# addon name -> (feature pipeline, source label used in the importance CSV)
-ADDON_SOURCE = {"catch22": "catch22", "freshprince": "tsfresh"}
-
-
-def _addon_transformer(addon):
-    if addon == "catch22":
-        return Pipeline([("reshape", UnivariateToCollection()), ("feat", Catch22())])
-    if addon == "freshprince":
-        return Pipeline(
-            [("reshape", UnivariateToCollection()),
-             ("feat", TSFresh(default_fc_parameters="efficient"))]
-        )
-    raise ValueError(f"Unknown addon: {addon}")
+# --- feature generators (TS -> feature matrix) -------------------------------
+#
+# Every method is just a feature generator. A generator exposes:
+#   fit_transform(X, y) -> train feature matrix
+#   transform(X)        -> test feature matrix
+#   records()           -> one descriptor per column (source + structured fields)
+# Experiments concatenate generators and feed a single shared classifier.
 
 
 def _clean_features(matrix):
     return np.nan_to_num(np.asarray(matrix, dtype=float), posinf=1e9, neginf=-1e9, nan=0.0)
 
 
-class TopGenAddonClassifier(BaseEstimator, ClassifierMixin):
-    """TopGen features concatenated with an addon feature set, then one random forest."""
+class TopGenGenerator:
+    """TopGen population-level cross-persistence features (leakage-free LOO on train)."""
 
-    def __init__(self, addon="catch22", random_state=0, topgen_kwargs=None, rf_kwargs=None):
-        self.addon = addon
+    source = "topgen"
+
+    def __init__(self, random_state, topgen_kwargs):
+        self.transformer = TopGenTransformer(random_state=random_state, **topgen_kwargs)
+
+    def fit_transform(self, X, y):
+        return self.transformer.fit_transform(X, y)
+
+    def transform(self, X):
+        return self.transformer.transform(X)
+
+    def records(self):
+        return [{**r, "source": self.source} for r in self.transformer.feature_table()]
+
+
+class AeonGenerator:
+    """Whole-series aeon feature transformer (catch22 / TSFresh) as a generator."""
+
+    def __init__(self, source, transformer):
+        self.source = source
+        self.pipeline = Pipeline([("reshape", UnivariateToCollection()), ("feat", transformer)])
+        self.n_features_ = 0
+
+    def fit_transform(self, X, y):
+        matrix = _clean_features(self.pipeline.fit_transform(X, y))
+        self.n_features_ = matrix.shape[1]
+        return matrix
+
+    def transform(self, X):
+        return _clean_features(self.pipeline.transform(X))
+
+    def records(self):
+        return [
+            {"feature": f"{self.source}_{i}", "source": self.source,
+             "class_label": "", "rep": "", "hom_dim": "", "block": ""}
+            for i in range(self.n_features_)
+        ]
+
+
+def make_generator(name, random_state, topgen_kwargs):
+    if name == "topgen":
+        return TopGenGenerator(random_state, topgen_kwargs)
+    if name == "catch22":
+        return AeonGenerator("catch22", Catch22())
+    if name == "tsfresh":
+        return AeonGenerator("tsfresh", TSFresh(default_fc_parameters="efficient"))
+    raise ValueError(f"Unknown feature generator: {name}")
+
+
+def make_classifier(random_state, rf_kwargs):
+    # The model is just a choice; swap this for RotationForest etc. later.
+    return RandomForestClassifier(random_state=random_state, **rf_kwargs)
+
+
+class FeatureGeneratorClassifier(BaseEstimator, ClassifierMixin):
+    """Concatenate one or more TS feature generators, then a single shared classifier."""
+
+    def __init__(self, generators=("topgen",), random_state=0, topgen_kwargs=None, rf_kwargs=None):
+        self.generators = generators
         self.random_state = random_state
-        self.topgen_kwargs = TOPGEN_KWARGS if topgen_kwargs is None else topgen_kwargs
-        self.rf_kwargs = RF_KWARGS if rf_kwargs is None else rf_kwargs
+        self.topgen_kwargs = topgen_kwargs
+        self.rf_kwargs = rf_kwargs
         self.timings_: dict[str, float] = {}
 
     def fit(self, X, y):
         y = np.asarray(y)
         t0 = time.perf_counter()
-        self.topgen_ = TopGenTransformer(random_state=self.random_state, **self.topgen_kwargs)
-        X_topgen = self.topgen_.fit_transform(X, y)
-        self.addon_ = _addon_transformer(self.addon)
-        X_addon = _clean_features(self.addon_.fit_transform(X, y))
-        self.feature_records_ = _topgen_records(self.topgen_) + _addon_records(
-            ADDON_SOURCE[self.addon], X_addon.shape[1]
-        )
-        self.rf_ = RandomForestClassifier(random_state=self.random_state, **self.rf_kwargs)
-        self.rf_.fit(np.hstack([X_topgen, X_addon]), y)
+        topgen_kwargs = TOPGEN_KWARGS if self.topgen_kwargs is None else self.topgen_kwargs
+        rf_kwargs = RF_KWARGS if self.rf_kwargs is None else self.rf_kwargs
+
+        self.generators_ = [make_generator(n, self.random_state, topgen_kwargs) for n in self.generators]
+        blocks, records = [], []
+        for gen in self.generators_:
+            blocks.append(gen.fit_transform(X, y))
+            records += gen.records()
+        self.feature_records_ = records
+
+        self.clf_ = make_classifier(self.random_state, rf_kwargs)
+        self.clf_.fit(np.hstack(blocks), y)
+        self.classes_ = self.clf_.classes_
         self.timings_["fit_total"] = time.perf_counter() - t0
-        self.classes_ = self.rf_.classes_
+        self._merge_topgen_timings("fit_timings_", "topgen_fit")
         return self
 
     def predict(self, X):
         t0 = time.perf_counter()
-        X_topgen = self.topgen_.transform(X)
-        X_addon = _clean_features(self.addon_.transform(X))
-        self.last_test_features_ = np.hstack([X_topgen, X_addon])
-        y_pred = self.rf_.predict(self.last_test_features_)
+        blocks = [gen.transform(X) for gen in self.generators_]
+        self.last_test_features_ = np.hstack(blocks)
+        y_pred = self.clf_.predict(self.last_test_features_)
         self.timings_["predict_total"] = time.perf_counter() - t0
+        self._merge_topgen_timings("transform_timings_", "topgen_transform")
         return y_pred
+
+    def _merge_topgen_timings(self, attr, prefix):
+        for gen in self.generators_:
+            timings = getattr(getattr(gen, "transformer", None), attr, None)
+            if timings:
+                for key, value in timings.items():
+                    self.timings_[f"{prefix}_{key}"] = value
 
 
 # --- evaluation --------------------------------------------------------------
@@ -417,17 +359,9 @@ def _method_factory(
     topgen_kwargs: dict,
     rf_kwargs: dict,
 ):
-    if method_name == "TopGen":
-        return TopGenRFClassifier(seed, topgen_kwargs, rf_kwargs)
-    if method_name == "catch22":
-        return AeonCatch22Pipeline(seed, rf_kwargs)
-    if method_name == "FreshPRINCE":
-        return FreshPRINCEBaseline(seed, rf_kwargs)
-    if method_name == "TopGen+catch22":
-        return TopGenAddonClassifier("catch22", seed, topgen_kwargs, rf_kwargs)
-    if method_name == "TopGen+FreshPRINCE":
-        return TopGenAddonClassifier("freshprince", seed, topgen_kwargs, rf_kwargs)
-    raise ValueError(f"Unknown method: {method_name}")
+    if method_name not in EXPERIMENTS:
+        raise ValueError(f"Unknown method: {method_name}")
+    return FeatureGeneratorClassifier(EXPERIMENTS[method_name], seed, topgen_kwargs, rf_kwargs)
 
 
 def evaluate_holdout_timed(
@@ -462,14 +396,10 @@ def _format_timings(timings: dict[str, float]) -> str:
     parts = []
     for key in (
         "fit_total",
-        "topgen_fit",
-        "topgen_fit_self_densities",
         "topgen_fit_class_clouds",
-        "topgen_transform_train",
-        "topgen_transform_test",
-        "topgen_transform_test_cross_persistence",
-        "rf_fit",
-        "rf_predict",
+        "topgen_fit_self_densities",
+        "topgen_fit_cross_persistence",
+        "topgen_transform_cross_persistence",
         "predict_total",
         "total",
     ):
@@ -507,11 +437,11 @@ def run_experiments(
 
         if (
             hasattr(estimator, "feature_records_")
-            and hasattr(estimator, "rf_")
+            and hasattr(estimator, "clf_")
             and hasattr(estimator, "last_test_features_")
         ):
             save_feature_importances(
-                estimator.rf_,
+                estimator.clf_,
                 estimator.feature_records_,
                 dataset=dataset,
                 seed=seed,
@@ -682,13 +612,7 @@ def main() -> None:
     else:
         datasets = DATASETS
         seeds = SEEDS
-        methods = (
-            "TopGen",
-            "catch22",
-            "FreshPRINCE",
-            "TopGen+catch22",
-            "TopGen+FreshPRINCE",
-        )
+        methods = tuple(EXPERIMENTS)
         topgen_kwargs = TOPGEN_KWARGS
         rf_kwargs = RF_KWARGS
         run_cv = True
