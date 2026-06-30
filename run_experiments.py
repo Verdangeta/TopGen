@@ -13,13 +13,13 @@ from urllib.request import urlopen
 
 import numpy as np
 from aeon.classification.feature_based import FreshPRINCEClassifier
-from aeon.transformations.collection.feature_based import Catch22
+from aeon.transformations.collection.feature_based import Catch22, TSFresh
 from sklearn.base import BaseEstimator, ClassifierMixin, TransformerMixin
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.inspection import permutation_importance
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import StratifiedKFold, cross_val_score
-from sklearn.pipeline import FeatureUnion, Pipeline
+from sklearn.pipeline import Pipeline
 
 from topgen.features import ALL_REP_NAMES
 from topgen.topgen import TopGenTransformer
@@ -99,7 +99,9 @@ IMPORTANCE_FIELDS = (
     "dataset_type",
     "is_dynamical",
     "seed",
-    "method",
+    "experiment",
+    "importance_method",
+    "source",
     "feature",
     "class_label",
     "rep",
@@ -137,7 +139,7 @@ FRESHPRINCE_KWARGS = dict(default_fc_parameters="efficient", verbose=0)
 
 QUICK_DATASETS = ("GunPoint",)
 QUICK_SEEDS = (0,)
-QUICK_METHODS = ("TopGen", "catch22")
+QUICK_METHODS = ("TopGen", "TopGen+catch22")
 QUICK_TOPGEN_KWARGS = {
     **TOPGEN_KWARGS,
     "rep_names": ("mtd",),
@@ -310,6 +312,8 @@ class TopGenRFClassifier(BaseEstimator, ClassifierMixin):
         self.rf_.fit(X_train, y)
         self.timings_["rf_fit"] = time.perf_counter() - t0
 
+        self.feature_records_ = _topgen_records(self.topgen_)
+
         if hasattr(self.topgen_, "fit_timings_"):
             for key, value in self.topgen_.fit_timings_.items():
                 self.timings_[f"topgen_fit_{key}"] = value
@@ -337,47 +341,69 @@ class TopGenRFClassifier(BaseEstimator, ClassifierMixin):
         return y_pred
 
 
-class TopGenAddonClassifier(BaseEstimator, ClassifierMixin):
-    """TopGen + catch22 via FeatureUnion, then random forest."""
+def _topgen_records(transformer):
+    return [{**r, "source": "topgen"} for r in transformer.feature_table()]
 
-    def __init__(self, random_state: int = 0, topgen_kwargs: dict | None = None, rf_kwargs: dict | None = None):
+
+def _addon_records(source, n_features):
+    return [
+        {"feature": f"{source}_{i}", "source": source,
+         "class_label": "", "rep": "", "hom_dim": "", "block": ""}
+        for i in range(n_features)
+    ]
+
+
+# addon name -> (feature pipeline, source label used in the importance CSV)
+ADDON_SOURCE = {"catch22": "catch22", "freshprince": "tsfresh"}
+
+
+def _addon_transformer(addon):
+    if addon == "catch22":
+        return Pipeline([("reshape", UnivariateToCollection()), ("feat", Catch22())])
+    if addon == "freshprince":
+        return Pipeline(
+            [("reshape", UnivariateToCollection()),
+             ("feat", TSFresh(default_fc_parameters="efficient"))]
+        )
+    raise ValueError(f"Unknown addon: {addon}")
+
+
+def _clean_features(matrix):
+    return np.nan_to_num(np.asarray(matrix, dtype=float), posinf=1e9, neginf=-1e9, nan=0.0)
+
+
+class TopGenAddonClassifier(BaseEstimator, ClassifierMixin):
+    """TopGen features concatenated with an addon feature set, then one random forest."""
+
+    def __init__(self, addon="catch22", random_state=0, topgen_kwargs=None, rf_kwargs=None):
+        self.addon = addon
         self.random_state = random_state
         self.topgen_kwargs = TOPGEN_KWARGS if topgen_kwargs is None else topgen_kwargs
         self.rf_kwargs = RF_KWARGS if rf_kwargs is None else rf_kwargs
         self.timings_: dict[str, float] = {}
 
     def fit(self, X, y):
+        y = np.asarray(y)
         t0 = time.perf_counter()
-        self.pipeline_ = Pipeline(
-            [
-                (
-                    "features",
-                    FeatureUnion(
-                        [
-                            ("topgen", TopGenTransformer(random_state=self.random_state, **self.topgen_kwargs)),
-                            (
-                                "catch22",
-                                Pipeline(
-                                    [
-                                        ("reshape", UnivariateToCollection()),
-                                        ("catch22", Catch22()),
-                                    ]
-                                ),
-                            ),
-                        ]
-                    ),
-                ),
-                ("rf", RandomForestClassifier(random_state=self.random_state, **self.rf_kwargs)),
-            ]
+        self.topgen_ = TopGenTransformer(random_state=self.random_state, **self.topgen_kwargs)
+        X_topgen = self.topgen_.fit_transform(X, y)
+        self.addon_ = _addon_transformer(self.addon)
+        X_addon = _clean_features(self.addon_.fit_transform(X, y))
+        self.feature_records_ = _topgen_records(self.topgen_) + _addon_records(
+            ADDON_SOURCE[self.addon], X_addon.shape[1]
         )
-        self.pipeline_.fit(X, y)
+        self.rf_ = RandomForestClassifier(random_state=self.random_state, **self.rf_kwargs)
+        self.rf_.fit(np.hstack([X_topgen, X_addon]), y)
         self.timings_["fit_total"] = time.perf_counter() - t0
-        self.classes_ = self.pipeline_.named_steps["rf"].classes_
+        self.classes_ = self.rf_.classes_
         return self
 
     def predict(self, X):
         t0 = time.perf_counter()
-        y_pred = self.pipeline_.predict(X)
+        X_topgen = self.topgen_.transform(X)
+        X_addon = _clean_features(self.addon_.transform(X))
+        self.last_test_features_ = np.hstack([X_topgen, X_addon])
+        y_pred = self.rf_.predict(self.last_test_features_)
         self.timings_["predict_total"] = time.perf_counter() - t0
         return y_pred
 
@@ -398,7 +424,9 @@ def _method_factory(
     if method_name == "FreshPRINCE":
         return FreshPRINCEBaseline(seed, rf_kwargs)
     if method_name == "TopGen+catch22":
-        return TopGenAddonClassifier(seed, topgen_kwargs, rf_kwargs)
+        return TopGenAddonClassifier("catch22", seed, topgen_kwargs, rf_kwargs)
+    if method_name == "TopGen+FreshPRINCE":
+        return TopGenAddonClassifier("freshprince", seed, topgen_kwargs, rf_kwargs)
     raise ValueError(f"Unknown method: {method_name}")
 
 
@@ -477,14 +505,19 @@ def run_experiments(
         estimator = _method_factory(method_name, seed, topgen_kwargs, rf_kwargs)
         holdout_acc, timings = evaluate_holdout_timed(train_X, train_y, test_X, test_y, estimator)
 
-        if method_name == "TopGen" and hasattr(estimator, "rf_") and hasattr(estimator, "last_test_features_"):
+        if (
+            hasattr(estimator, "feature_records_")
+            and hasattr(estimator, "rf_")
+            and hasattr(estimator, "last_test_features_")
+        ):
             save_feature_importances(
                 estimator.rf_,
-                estimator.topgen_,
+                estimator.feature_records_,
                 dataset=dataset,
                 seed=seed,
                 dataset_type=DATASET_TYPES.get(dataset, "UNKNOWN"),
                 is_dynamical=is_dynamical(dataset),
+                experiment=method_name,
                 out_dir=IMPORTANCE_DIR,
                 X_val=estimator.last_test_features_,
                 y_val=test_y,
@@ -521,19 +554,19 @@ def run_experiments(
 
 def save_feature_importances(
     rf,
-    transformer,
+    feature_records,
     *,
     dataset: str,
     seed: int,
     dataset_type: str,
     is_dynamical: bool,
+    experiment: str,
     out_dir: str,
-    method: str = "permutation",
+    importance_method: str = "permutation",
     X_val=None,
     y_val=None,
 ) -> None:
-    table = transformer.feature_table()
-    if method == "permutation":
+    if importance_method == "permutation":
         if X_val is None or y_val is None:
             raise ValueError("permutation importance requires X_val and y_val")
         result = permutation_importance(
@@ -541,29 +574,31 @@ def save_feature_importances(
         )
         importances = result.importances_mean
         stds = result.importances_std
-    elif method == "impurity":
+    elif importance_method == "impurity":
         importances = rf.feature_importances_
         stds = np.full(len(importances), np.nan)
     else:
-        raise ValueError(f"Unknown importance method: {method}")
+        raise ValueError(f"Unknown importance method: {importance_method}")
 
-    if len(table) != len(importances):
+    if len(feature_records) != len(importances):
         raise ValueError(
-            f"feature table length {len(table)} != importance length {len(importances)}"
+            f"feature records {len(feature_records)} != importance length {len(importances)}"
         )
 
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, os.path.basename(IMPORTANCE_CSV))
     write_header = not os.path.exists(path)
     rows = []
-    for meta, importance, importance_std in zip(table, importances, stds):
+    for meta, importance, importance_std in zip(feature_records, importances, stds):
         rows.append(
             {
                 "dataset": dataset,
                 "dataset_type": dataset_type,
                 "is_dynamical": is_dynamical,
                 "seed": seed,
-                "method": method,
+                "experiment": experiment,
+                "importance_method": importance_method,
+                "source": meta["source"],
                 "feature": meta["feature"],
                 "class_label": meta["class_label"],
                 "rep": meta["rep"],
@@ -627,7 +662,7 @@ def main() -> None:
     parser.add_argument(
         "--quick",
         action="store_true",
-        help="GunPoint only, seed 0, TopGen+catch22, holdout only, MTD reps, RF n_estimators=50",
+        help="GunPoint only, seed 0, TopGen and TopGen+catch22, holdout only, MTD reps, RF n_estimators=50",
     )
     parser.add_argument(
         "--output",
@@ -647,7 +682,13 @@ def main() -> None:
     else:
         datasets = DATASETS
         seeds = SEEDS
-        methods = ("TopGen", "catch22", "FreshPRINCE", "TopGen+catch22")
+        methods = (
+            "TopGen",
+            "catch22",
+            "FreshPRINCE",
+            "TopGen+catch22",
+            "TopGen+FreshPRINCE",
+        )
         topgen_kwargs = TOPGEN_KWARGS
         rf_kwargs = RF_KWARGS
         run_cv = True
