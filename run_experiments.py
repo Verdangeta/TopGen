@@ -129,6 +129,7 @@ TOPGEN_KWARGS = dict(
     density_repeats=1,
     stride=3,
     pdist_device="cuda",
+    cache_dir="results/barcode_cache",
     record_timing=True,
 )
 
@@ -765,6 +766,18 @@ def main() -> None:
         metavar="SEED",
         help="Random seeds to run (default: 0 for --quick, 0-4 for full run).",
     )
+    parser.add_argument(
+        "--all-datasets",
+        action="store_true",
+        help="Include TUNING_DATASETS in addition to REPORT_DATASETS (15 total).",
+    )
+    parser.add_argument(
+        "--datasets",
+        nargs="+",
+        default=None,
+        metavar="DATASET",
+        help="Explicit dataset list to run (overrides --all-datasets/default split).",
+    )
     args = parser.parse_args()
 
     if args.quick:
@@ -776,7 +789,14 @@ def main() -> None:
         run_cv = False
         output = args.output or "results/accuracy_table_quick.csv"
     else:
-        datasets = DATASETS
+        base_datasets = REPORT_DATASETS + TUNING_DATASETS if args.all_datasets else DATASETS
+        if args.datasets is not None:
+            unknown = [name for name in args.datasets if name not in DATASET_TYPES]
+            if unknown:
+                raise ValueError("Unknown dataset(s): " + ", ".join(unknown))
+            datasets = tuple(args.datasets)
+        else:
+            datasets = base_datasets
         seeds = tuple(args.seeds) if args.seeds is not None else SEEDS
         methods = tuple(EXPERIMENTS)
         topgen_kwargs = TOPGEN_KWARGS
