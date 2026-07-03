@@ -81,10 +81,11 @@ def _barcode_to_npz_arrays(barcode) -> dict[str, np.ndarray]:
     return arrays
 
 
-def _barcode_from_npz(payload) -> list[np.ndarray]:
-    """Reconstruct the list-of-homology-dims structure MTopDiv returns."""
+def _barcode_from_npz(payload) -> np.ndarray:
+    """Reconstruct MTopDiv barcode as object-array to preserve .shape API."""
     n_hom = int(np.asarray(payload["n_hom"]).ravel()[0])
-    return [np.asarray(payload[f"h{hom_dim}"], dtype=float) for hom_dim in range(n_hom)]
+    bars = [np.asarray(payload[f"h{hom_dim}"], dtype=float) for hom_dim in range(n_hom)]
+    return np.asarray(bars, dtype=object)
 
 
 def _load_barcode_cache(cache_path: str):
