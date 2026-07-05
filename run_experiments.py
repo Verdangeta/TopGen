@@ -133,9 +133,13 @@ TOPGEN_KWARGS = dict(
     record_timing=True,
 )
 
-# Shared classifier on top of the concatenated feature generators. The model is just
-# a choice (RF for now); swap RF_KWARGS / make_classifier for e.g. RotationForest later.
+# Shared classifier on top of the concatenated feature generators.
 RF_KWARGS = dict(n_estimators=200, n_jobs=-1)
+ROTATION_FOREST_KWARGS = dict(n_estimators=200, n_jobs=-1)
+CLASSIFIER_KWARGS = {
+    "rf": RF_KWARGS,
+    "rotation_forest": ROTATION_FOREST_KWARGS,
+}
 
 # An experiment = which feature generators to concatenate before the shared classifier.
 EXPERIMENTS = {
@@ -305,9 +309,18 @@ def make_generator(name, random_state, topgen_kwargs):
     raise ValueError(f"Unknown feature generator: {name}")
 
 
-def make_classifier(random_state, rf_kwargs):
-    # The model is just a choice; swap this for RotationForest etc. later.
-    return RandomForestClassifier(random_state=random_state, **rf_kwargs)
+def make_classifier(random_state, clf_kwargs, classifier_name: str = "rf"):
+    """Build a tabular classifier (RF or aeon RotationForestClassifier)."""
+    if classifier_name == "rf":
+        return RandomForestClassifier(random_state=random_state, **clf_kwargs)
+    if classifier_name == "rotation_forest":
+        from aeon.classification.sklearn import RotationForestClassifier
+
+        return RotationForestClassifier(random_state=random_state, **clf_kwargs)
+    raise ValueError(
+        f"Unknown classifier: {classifier_name!r} "
+        f"(expected one of {tuple(CLASSIFIER_KWARGS)})"
+    )
 
 
 # --- evaluation --------------------------------------------------------------

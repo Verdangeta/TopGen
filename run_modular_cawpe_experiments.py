@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Modular fusion experiments: one classifier per feature block, uniform proba average."""
+"""Modular CAWPE fusion: combo methods only, weights from precomputed solo holdout accuracies."""
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import time
 
@@ -20,49 +21,93 @@ except ImportError:
         return iterable
 
 
-OUTPUT_CSV = "results/accuracy_table_modular_uniform.csv"
-OUTPUT_CSV_BY_CLASSIFIER = {
-    "rf": OUTPUT_CSV,
-    "rotation_forest": "results/accuracy_table_modular_uniform_rotation_forest.csv",
+OUTPUT_CSV = "results/accuracy_table_modular_cawpe.csv"
+DEFAULT_SOLO_CSV = "results/accuracy_table_final.csv"
+METHOD_PREFIX = "Modular-CAWPE:"
+DEFAULT_CAWPE_ALPHA = 4.0
+
+COMBO_METHODS = ("TopGen+catch22", "TopGen+TSFresh")
+SOLO_METHODS = ("TopGen", "catch22", "TSFresh")
+MODULE_TO_SOLO_METHOD = {
+    "topgen": "TopGen",
+    "catch22": "catch22",
+    "tsfresh": "TSFresh",
 }
-METHOD_PREFIX = "Modular:"
 
 
-def fit_predict_modular_uniform(
+def load_solo_holdout_accuracies(csv_path: str) -> dict[tuple[str, int, str], float]:
+    """Map (dataset, seed, module_name) -> holdout accuracy from solo-method rows."""
+    accuracies: dict[tuple[str, int, str], float] = {}
+    solo_method_to_module = {method: module for module, method in MODULE_TO_SOLO_METHOD.items()}
+    with open(csv_path, newline="") as handle:
+        for row in csv.DictReader(handle):
+            method = row["method"]
+            if method not in solo_method_to_module:
+                continue
+            key = (row["dataset"], int(row["seed"]), solo_method_to_module[method])
+            accuracies[key] = float(row["holdout_accuracy"])
+    return accuracies
+
+
+def cawpe_weights(
+    module_names: tuple[str, ...],
+    solo_accuracies: dict[str, float],
+    alpha: float,
+) -> tuple[np.ndarray, dict[str, float]]:
+    """CAWPE weights w_j = acc_j^alpha, normalized over modules in this ensemble."""
+    raw = {name: solo_accuracies[name] ** alpha for name in module_names}
+    total = sum(raw.values())
+    if total <= 0.0:
+        raise ValueError(f"Non-positive CAWPE weight sum for modules {module_names}: {raw}")
+    normalized = {name: value / total for name, value in raw.items()}
+    return np.array([normalized[name] for name in module_names]), normalized
+
+
+def fit_predict_modular_cawpe(
     feature_blocks: dict[str, exp.FeatureBlock],
     module_names: tuple[str, ...],
+    solo_accuracies: dict[str, float],
     y_train: np.ndarray,
     y_eval: np.ndarray,
     seed: int,
     clf_kwargs: dict,
-    classifier_name: str = "rf",
-) -> tuple[float, dict[str, float]]:
-    """Train one classifier per module; predict via uniform average of predict_proba."""
+    alpha: float,
+) -> tuple[float, dict[str, float], dict[str, float]]:
+    """Train one classifier per module; fuse with CAWPE weights from solo holdout accuracies."""
+    weights, weight_by_module = cawpe_weights(module_names, solo_accuracies, alpha)
+
     t0 = time.perf_counter()
     classifiers = []
     probas = []
     for name in module_names:
         block = feature_blocks[name]
-        clf = exp.make_classifier(seed, clf_kwargs, classifier_name)
+        clf = exp.make_classifier(seed, clf_kwargs)
         clf.fit(block.train, y_train)
         classifiers.append(clf)
         probas.append(clf.predict_proba(block.eval))
     classifier_fit = time.perf_counter() - t0
 
-    avg_proba = np.mean(probas, axis=0)
+    fused_proba = np.zeros_like(probas[0], dtype=float)
+    for weight, proba in zip(weights, probas):
+        fused_proba += weight * proba
     classes = classifiers[0].classes_
-    y_pred = classes[np.argmax(avg_proba, axis=1)]
+    y_pred = classes[np.argmax(fused_proba, axis=1)]
 
     t0 = time.perf_counter()
     acc = float(accuracy_score(y_eval, y_pred))
     classifier_predict = time.perf_counter() - t0
 
-    return acc, {
+    timings = {
         "classifier_fit": classifier_fit,
         "classifier_predict": classifier_predict,
         "classifier_total": classifier_fit + classifier_predict,
         "n_modules": float(len(module_names)),
+        "cawpe_alpha": alpha,
     }
+    for name, weight in weight_by_module.items():
+        timings[f"cawpe_weight_{name}"] = weight
+        timings[f"cawpe_solo_acc_{name}"] = solo_accuracies[name]
+    return acc, timings, weight_by_module
 
 
 def _timings_for_modular_method(
@@ -82,16 +127,34 @@ def _timings_for_modular_method(
     return timings
 
 
-def run_modular_experiments(
+def _solo_accuracies_for_split(
+    dataset: str,
+    seed: int,
+    solo_table: dict[tuple[str, int, str], float],
+) -> dict[str, float]:
+    solo: dict[str, float] = {}
+    missing: list[str] = []
+    for module, method in MODULE_TO_SOLO_METHOD.items():
+        key = (dataset, seed, module)
+        if key not in solo_table:
+            missing.append(f"{method} ({module})")
+            continue
+        solo[module] = solo_table[key]
+    if missing:
+        raise KeyError(f"Missing solo accuracies for {dataset} seed={seed}: {', '.join(missing)}")
+    return solo
+
+
+def run_modular_cawpe_experiments(
     datasets: tuple[str, ...],
     seeds: tuple[int, ...],
     methods: tuple[str, ...],
     topgen_kwargs: dict,
     clf_kwargs: dict,
-    classifier_name: str = "rf",
+    solo_table: dict[tuple[str, int, str], float],
+    alpha: float,
     output_csv: str | None = None,
 ) -> list[dict[str, object]]:
-    """Holdout evaluation with modular uniform probability fusion."""
     rows: list[dict[str, object]] = []
     data_cache: dict[str, tuple[np.ndarray, ...]] = {}
     generator_names = exp._unique_generators(methods)
@@ -103,6 +166,7 @@ def run_modular_experiments(
             data_cache[dataset] = exp.load_ucr(dataset)
         train_X, train_y, test_X, test_y = data_cache[dataset]
         n_classes = len(np.unique(train_y))
+        solo_accuracies = _solo_accuracies_for_split(dataset, seed, solo_table)
 
         if dataset != last_dataset:
             print(f"\n{dataset}: train {train_X.shape}, test {test_X.shape}, classes={n_classes}")
@@ -115,17 +179,20 @@ def run_modular_experiments(
 
         for method_name in methods:
             module_names = exp.EXPERIMENTS[method_name]
-            holdout_acc, clf_timings = fit_predict_modular_uniform(
+            module_solo = {name: solo_accuracies[name] for name in module_names}
+            holdout_acc, clf_timings, weights = fit_predict_modular_cawpe(
                 feature_blocks,
                 module_names,
+                module_solo,
                 train_y,
                 test_y,
                 seed,
                 clf_kwargs,
-                classifier_name,
+                alpha,
             )
             timings = _timings_for_modular_method(method_name, feature_blocks, clf_timings)
             csv_method = f"{METHOD_PREFIX}{method_name}"
+            weight_str = ", ".join(f"{name}={weights[name]:.3f}" for name in module_names)
 
             row = {
                 "dataset": dataset,
@@ -142,7 +209,8 @@ def run_modular_experiments(
             }
             rows.append(row)
             print(
-                f"  {csv_method:24s} seed={seed}  holdout={holdout_acc:.4f}"
+                f"  {csv_method:30s} seed={seed}  holdout={holdout_acc:.4f}"
+                f"  weights: {weight_str}"
                 f"  {exp._format_timings(timings)}"
             )
             if output_csv is not None:
@@ -154,22 +222,36 @@ def _validate_methods(methods: tuple[str, ...]) -> tuple[str, ...]:
     unknown = [name for name in methods if name not in exp.EXPERIMENTS]
     if unknown:
         raise ValueError("Unknown method(s): " + ", ".join(unknown))
+    non_combo = [name for name in methods if name not in COMBO_METHODS]
+    if non_combo:
+        raise ValueError("This runner supports combo methods only: " + ", ".join(non_combo))
     return methods
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Modular fusion runner: independent classifiers + uniform proba average"
+        description="Modular CAWPE runner (combo methods; solo accuracies from an existing CSV)"
     )
     parser.add_argument(
         "--quick",
         action="store_true",
-        help="GunPoint only, seed 0, TopGen and TopGen+catch22, MTD reps, RF n_estimators=50",
+        help="GunPoint only, seed 0, TopGen+catch22, MTD reps, RF n_estimators=50",
     )
     parser.add_argument(
         "--output",
         default=None,
         help=f"CSV output path (default: {OUTPUT_CSV})",
+    )
+    parser.add_argument(
+        "--solo-accuracy-csv",
+        default=DEFAULT_SOLO_CSV,
+        help="CSV with solo TopGen / catch22 / TSFresh holdout accuracies",
+    )
+    parser.add_argument(
+        "--cawpe-alpha",
+        type=float,
+        default=DEFAULT_CAWPE_ALPHA,
+        help="CAWPE exponent alpha (weight_j = solo_acc_j^alpha)",
     )
     parser.add_argument(
         "--seeds",
@@ -196,23 +278,23 @@ def main() -> None:
         nargs="+",
         default=None,
         metavar="METHOD",
-        help="Experiment recipes from run_experiments.EXPERIMENTS (default: all).",
-    )
-    parser.add_argument(
-        "--classifier",
-        choices=tuple(exp.CLASSIFIER_KWARGS),
-        default="rf",
-        help="Classifier for each module (default: rf).",
+        help=f"Combo methods only (default: {', '.join(COMBO_METHODS)})",
     )
     args = parser.parse_args()
+
+    solo_table = load_solo_holdout_accuracies(args.solo_accuracy_csv)
+    if not solo_table:
+        raise ValueError(f"No solo accuracies found in {args.solo_accuracy_csv}")
 
     if args.quick:
         datasets = exp.QUICK_DATASETS
         seeds = tuple(args.seeds) if args.seeds is not None else exp.QUICK_SEEDS
-        methods = _validate_methods(tuple(args.methods) if args.methods else exp.QUICK_METHODS)
+        methods = _validate_methods(
+            tuple(args.methods) if args.methods else ("TopGen+catch22",)
+        )
         topgen_kwargs = exp.QUICK_TOPGEN_KWARGS
-        clf_kwargs = exp.QUICK_RF_KWARGS if args.classifier == "rf" else exp.ROTATION_FOREST_KWARGS
-        output = args.output or "results/accuracy_table_modular_quick.csv"
+        clf_kwargs = exp.QUICK_RF_KWARGS
+        output = args.output or "results/accuracy_table_modular_cawpe_quick.csv"
     else:
         base_datasets = exp.REPORT_DATASETS + exp.TUNING_DATASETS if args.all_datasets else exp.DATASETS
         if args.datasets is not None:
@@ -223,10 +305,10 @@ def main() -> None:
         else:
             datasets = base_datasets
         seeds = tuple(args.seeds) if args.seeds is not None else exp.SEEDS
-        methods = _validate_methods(tuple(args.methods) if args.methods else tuple(exp.EXPERIMENTS))
+        methods = _validate_methods(tuple(args.methods) if args.methods else COMBO_METHODS)
         topgen_kwargs = exp.TOPGEN_KWARGS
-        clf_kwargs = exp.CLASSIFIER_KWARGS[args.classifier]
-        output = args.output or OUTPUT_CSV_BY_CLASSIFIER[args.classifier]
+        clf_kwargs = exp.RF_KWARGS
+        output = args.output or OUTPUT_CSV
 
     train_X, train_y, test_X, test_y = exp.load_ucr(datasets[0])
     exp.explain_runtime_cost(
@@ -240,12 +322,19 @@ def main() -> None:
         run_cv=False,
     )
     print(
-        f"Fusion: modular uniform average ({METHOD_PREFIX}* methods in CSV); "
-        f"classifier={args.classifier}"
+        f"Fusion: modular CAWPE (alpha={args.cawpe_alpha}) from {args.solo_accuracy_csv}; "
+        f"methods: {', '.join(methods)}"
     )
 
-    rows = run_modular_experiments(
-        datasets, seeds, methods, topgen_kwargs, clf_kwargs, args.classifier, output
+    rows = run_modular_cawpe_experiments(
+        datasets,
+        seeds,
+        methods,
+        topgen_kwargs,
+        clf_kwargs,
+        solo_table,
+        args.cawpe_alpha,
+        output,
     )
     exp.write_csv(rows, output)
     exp.summarize_by_type(rows)
