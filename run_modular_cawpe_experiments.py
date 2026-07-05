@@ -248,6 +248,11 @@ def main() -> None:
         help="CSV with solo TopGen / catch22 / TSFresh holdout accuracies",
     )
     parser.add_argument(
+        "--lite",
+        action="store_true",
+        help="TopGen lite: H0-only hom_dims=(0,) and rep_names without betti_2.",
+    )
+    parser.add_argument(
         "--cawpe-alpha",
         type=float,
         default=DEFAULT_CAWPE_ALPHA,
@@ -306,9 +311,13 @@ def main() -> None:
             datasets = base_datasets
         seeds = tuple(args.seeds) if args.seeds is not None else exp.SEEDS
         methods = _validate_methods(tuple(args.methods) if args.methods else COMBO_METHODS)
-        topgen_kwargs = exp.TOPGEN_KWARGS
+        topgen_kwargs = exp.LITE_TOPGEN_KWARGS if args.lite else exp.TOPGEN_KWARGS
         clf_kwargs = exp.RF_KWARGS
-        output = args.output or OUTPUT_CSV
+        output = args.output or (
+            "results/accuracy_table_modular_cawpe_lite.csv"
+            if args.lite
+            else OUTPUT_CSV
+        )
 
     train_X, train_y, test_X, test_y = exp.load_ucr(datasets[0])
     exp.explain_runtime_cost(

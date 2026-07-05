@@ -21,7 +21,7 @@ from sklearn.metrics import accuracy_score
 from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
 
-from topgen.features import ALL_REP_NAMES
+from topgen.features import ALL_REP_NAMES, LITE_REP_NAMES
 from topgen.topgen import TopGenTransformer
 
 try:
@@ -153,6 +153,12 @@ EXPERIMENTS = {
 QUICK_DATASETS = ("GunPoint",)
 QUICK_SEEDS = (0,)
 QUICK_METHODS = ("TopGen", "TopGen+catch22")
+LITE_TOPGEN_KWARGS = {
+    **TOPGEN_KWARGS,
+    "hom_dims": (0,),
+    "rep_names": LITE_REP_NAMES,
+}
+
 QUICK_TOPGEN_KWARGS = {
     **TOPGEN_KWARGS,
     "rep_names": ("mtd",),
@@ -767,6 +773,11 @@ def main() -> None:
         help="CSV output path (default: results/accuracy_table_quick.csv or accuracy_table.csv)",
     )
     parser.add_argument(
+        "--lite",
+        action="store_true",
+        help="TopGen lite: H0-only hom_dims=(0,) and rep_names without betti_2.",
+    )
+    parser.add_argument(
         "--no-cv",
         action="store_true",
         help="Skip cross-validation; run the train/test holdout split only (faster).",
@@ -812,10 +823,10 @@ def main() -> None:
             datasets = base_datasets
         seeds = tuple(args.seeds) if args.seeds is not None else SEEDS
         methods = tuple(EXPERIMENTS)
-        topgen_kwargs = TOPGEN_KWARGS
+        topgen_kwargs = LITE_TOPGEN_KWARGS if args.lite else TOPGEN_KWARGS
         rf_kwargs = RF_KWARGS
         run_cv = not args.no_cv
-        output = args.output or OUTPUT_CSV
+        output = args.output or ("results/accuracy_table_lite.csv" if args.lite else OUTPUT_CSV)
 
     train_X, train_y, test_X, test_y = load_ucr(datasets[0])
     explain_runtime_cost(

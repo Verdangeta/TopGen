@@ -37,6 +37,7 @@ python run_minimal_demo.py
 This fits `TopGenTransformer` on GunPoint and prints train/test feature matrices.
 Per-class feature count with `R={MTD}`: **8** (4 B1 + 2 B2 + 2 B3) × number of classes.
 With all seven representations (`ALL_REP_NAMES`): **56** per class.
+Lite preset (`hom_dims=(0,)`, no `betti_2`): **24** per class.
 
 ## Experiments
 
@@ -44,8 +45,40 @@ With all seven representations (`ALL_REP_NAMES`): **56** per class.
 python run_experiments.py --quick    # ~1–2 min smoke test (GunPoint, holdout only)
 python run_experiments.py            # report datasets, 5 seeds, holdout + CV
 python run_experiments.py --no-cv    # same grid but holdout only (skips CV, much faster)
+python run_experiments.py --lite     # lite TopGen (H0-only, no betti_2) → accuracy_table_lite.csv
 python run_experiments.py --seeds 0 1 2   # override default seeds (works with --quick / --no-cv)
 ```
+
+### Lite TopGen preset
+
+`--lite` sets `hom_dims=(0,)` and drops `betti_2` from `rep_names` (6 reps, H0 only).
+Per-class feature count: **24** (vs 56 full). Same API; `_per_class_feature_count()` updates automatically.
+Optional constructor: `TopGenTransformer.lite(...)`.
+
+### Fusion CV (OOF CAWPE + stacking)
+
+```bash
+python run_fusion_cv.py --quick
+python run_fusion_cv.py --lite
+```
+
+One train-only CV pass produces:
+
+- `results/fusion_cv/cawpe_weights.csv` — OOF-based CAWPE weights per combo/module
+- `results/fusion_cv/oof_stack/{dataset}_seed{seed}.npz` — OOF probability matrix for meta-learner
+- `results/accuracy_table_fusion_cv.csv` — `CAWPE-cv:*` and `Stacking:LR:*` / `Stacking:HGB:*` rows
+
+Weights and meta-learner are fit on train OOF only; holdout test is untouched.
+
+### Feature independence (TopGen blocks vs baselines)
+
+```bash
+python run_independence.py --quick
+python run_independence.py --full-topgen   # full TopGen instead of lite default
+```
+
+Output: `results/independence/independence.csv` — long format with `dataset, block, partner, metric, value, null_mean, p_value`.
+Metrics: `residual_r2` (mean 1−R²) and `cca_mean_rho` with permutation null (≥200 by default).
 
 ### Methods are feature generators
 

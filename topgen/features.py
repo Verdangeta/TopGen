@@ -22,6 +22,7 @@ ALL_REP_NAMES: tuple[str, ...] = (
     "betti_1",
     "betti_2",
 )
+LITE_REP_NAMES: tuple[str, ...] = tuple(rep for rep in ALL_REP_NAMES if rep != "betti_2")
 
 REPRESENTATIONS = ALL_REP_NAMES
 

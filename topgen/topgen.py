@@ -21,6 +21,7 @@ from topgen.clouds import (
 )
 from topgen.features import (
     ALL_REP_NAMES,
+    LITE_REP_NAMES,
     assemble_blocks,
     barcode_lifetimes,
     betti_thresholds_from_lifetimes,
@@ -166,6 +167,17 @@ class TopGenTransformer(BaseEstimator, TransformerMixin):
         self.record_timing = record_timing
         self.debug_sizes = debug_sizes
         self.cache_dir = cache_dir
+
+    @classmethod
+    def lite(cls, **overrides):
+        """H0-only preset without betti_2 (half the homology/rep footprint)."""
+        params = dict(
+            hom_dims=(0,),
+            rep_names=LITE_REP_NAMES,
+            blocks=("b1", "b2", "b3"),
+        )
+        params.update(overrides)
+        return cls(**params)
 
     def fit(self, X, y):
         """Leave-one-series-out pass: builds class clouds, freezes self-densities,
