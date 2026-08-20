@@ -63,6 +63,7 @@ def collect_modular_oof(
     seed: int,
     topgen_kwargs: dict,
     clf_kwargs: dict,
+    cv_folds: int,
 ) -> tuple[dict[str, np.ndarray], dict[str, float], np.ndarray, dict[str, float]]:
     """One StratifiedKFold pass on train: per-module OOF predict_proba."""
     n_train = train_y.shape[0]
@@ -71,9 +72,9 @@ def collect_modular_oof(
     oof_proba = {name: np.zeros((n_train, n_classes), dtype=float) for name in module_names}
     cv_timings = {"cv_feature_total": 0.0, "cv_classifier_fit": 0.0}
 
-    cv = StratifiedKFold(n_splits=exp.CV_FOLDS, shuffle=True, random_state=seed)
+    cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=seed)
     for fold_idx, (train_idx, val_idx) in enumerate(cv.split(train_X, train_y), start=1):
-        print(f"    CV fold {fold_idx}/{exp.CV_FOLDS}: computing feature generators once")
+        print(f"    CV fold {fold_idx}/{cv_folds}: computing feature generators once")
         fold_blocks = exp.compute_feature_blocks(
             module_names,
             train_X[train_idx],
@@ -280,13 +281,16 @@ def run_fusion_cv_experiments(
     clf_kwargs: dict,
     alpha: float,
     meta_learners: tuple[str, ...],
+    cv_folds: int,
     output_csv: str | None = None,
+    cawpe_weights_csv: str = CAWPE_WEIGHTS_CSV,
+    oof_stack_dir: str = OOF_STACK_DIR,
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     data_cache: dict[str, tuple[np.ndarray, ...]] = {}
     split_jobs = [(dataset, seed) for dataset in datasets for seed in seeds]
     last_dataset = None
-    reset_cawpe_weights_csv()
+    reset_cawpe_weights_csv(cawpe_weights_csv)
 
     for dataset, seed in tqdm(split_jobs, desc="splits", unit="split"):
         if dataset not in data_cache:
@@ -300,10 +304,10 @@ def run_fusion_cv_experiments(
 
         print(f"  seed={seed}: CV on train only ({', '.join(SOLO_MODULES)})")
         oof_proba, oof_acc, classes, cv_timings = collect_modular_oof(
-            train_X, train_y, SOLO_MODULES, seed, topgen_kwargs, clf_kwargs
+            train_X, train_y, SOLO_MODULES, seed, topgen_kwargs, clf_kwargs, cv_folds
         )
         stack_all = build_stacking_matrix(oof_proba, SOLO_MODULES)
-        save_oof_stack(dataset, seed, train_y, classes, SOLO_MODULES, oof_proba, stack_all)
+        save_oof_stack(dataset, seed, train_y, classes, SOLO_MODULES, oof_proba, stack_all, oof_stack_dir)
 
         print(f"  seed={seed}: holdout feature generators ({', '.join(SOLO_MODULES)})")
         feature_blocks = exp.compute_feature_blocks(
@@ -320,7 +324,14 @@ def run_fusion_cv_experiments(
                 module_oof_proba, module_names, module_oof_acc, alpha
             )
             append_cawpe_weights(
-                dataset, seed, method_name, module_names, module_oof_acc, weight_by_module, alpha
+                dataset,
+                seed,
+                method_name,
+                module_names,
+                module_oof_acc,
+                weight_by_module,
+                alpha,
+                cawpe_weights_csv,
             )
             y_pred_cawpe_oof = classes[np.argmax(fused_oof, axis=1)]
             cv_acc_cawpe = float(accuracy_score(train_y, y_pred_cawpe_oof))
@@ -446,7 +457,19 @@ def main() -> None:
     )
     parser.add_argument("--quick", action="store_true", help="GunPoint, seed 0, TopGen+catch22")
     parser.add_argument("--lite", action="store_true", help="Use LITE_TOPGEN_KWARGS")
+    parser.add_argument(
+        "--cv-folds",
+        type=int,
+        default=3,
+        metavar="K",
+        help="Stratified CV folds on train for OOF weights/meta (default: 3).",
+    )
     parser.add_argument("--output", default=None, help=f"Accuracy CSV (default: {OUTPUT_CSV})")
+    parser.add_argument(
+        "--artifact-dir",
+        default=None,
+        help="Directory for cawpe_weights.csv and oof_stack/ (default: results/fusion_cv_lite or results/fusion_cv_full)",
+    )
     parser.add_argument(
         "--cawpe-alpha", type=float, default=DEFAULT_CAWPE_ALPHA, help="CAWPE exponent alpha"
     )
@@ -488,9 +511,22 @@ def main() -> None:
         methods = _validate_methods(tuple(args.methods) if args.methods else COMBO_METHODS)
         topgen_kwargs = exp.LITE_TOPGEN_KWARGS if args.lite else exp.TOPGEN_KWARGS
         clf_kwargs = exp.RF_KWARGS
-        output = args.output or OUTPUT_CSV
+        output = args.output or (
+            "results/accuracy_table_fusion_cv_lite.csv"
+            if args.lite
+            else OUTPUT_CSV
+        )
+
+    artifact_dir = args.artifact_dir or (
+        "results/fusion_cv_lite" if args.lite else "results/fusion_cv_full"
+    )
+    cawpe_weights_csv = os.path.join(artifact_dir, "cawpe_weights.csv")
+    oof_stack_dir = os.path.join(artifact_dir, "oof_stack")
 
     train_X, train_y, test_X, test_y = exp.load_ucr(datasets[0])
+    if args.cv_folds < 2:
+        raise ValueError("--cv-folds must be at least 2")
+
     exp.explain_runtime_cost(
         n_train=train_X.shape[0],
         n_test=test_X.shape[0],
@@ -500,9 +536,10 @@ def main() -> None:
         n_seeds=len(seeds),
         methods=methods,
         run_cv=True,
+        cv_folds=args.cv_folds,
     )
     print(
-        f"Fusion CV: train-only OOF -> {CAWPE_WEIGHTS_CSV} + {OOF_STACK_DIR}/; "
+        f"Fusion CV: train-only {args.cv_folds}-fold OOF -> {cawpe_weights_csv} + {oof_stack_dir}/; "
         f"alpha={args.cawpe_alpha}; meta={','.join(meta_learners)}"
     )
 
@@ -514,7 +551,10 @@ def main() -> None:
         clf_kwargs,
         args.cawpe_alpha,
         meta_learners,
+        args.cv_folds,
         output,
+        cawpe_weights_csv,
+        oof_stack_dir,
     )
     exp.write_csv(rows, output)
     exp.summarize_by_type(rows)

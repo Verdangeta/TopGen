@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Feature independence: residual-R² and CCA between TopGen blocks and catch22/TSFresh."""
+"""Feature independence: explained-R² and CCA between TopGen blocks and catch22/TSFresh.
+
+Both statistics are computed out-of-sample via K-fold cross-validation, with all
+preprocessing (standardization and PCA) fitted on the training fold only, so a
+high-dimensional partner (e.g. TSFresh) cannot inflate the score by overfitting.
+A partner is a linear "explainer" of a block only insofar as it predicts held-out
+block values; the permutation test asks whether it explains the block better than
+chance.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +19,8 @@ import numpy as np
 from sklearn.cross_decomposition import CCA
 from sklearn.decomposition import PCA
 from sklearn.linear_model import Ridge
+from sklearn.metrics import r2_score
+from sklearn.model_selection import KFold
 from sklearn.preprocessing import StandardScaler
 
 import run_experiments as exp
@@ -26,9 +36,11 @@ except ImportError:
 OUTPUT_CSV = "results/independence/independence.csv"
 TOPGEN_BLOCKS = ("b1", "b2", "b3")
 PARTNERS = ("catch22", "tsfresh")
-METRICS = ("residual_r2", "cca_mean_rho")
+FEATURE_MODULES = ("topgen", "catch22", "tsfresh")
+METRICS = ("explained_r2", "cca_mean_rho")
 DEFAULT_N_PERM = 200
 RIDGE_ALPHA = 1.0
+MAX_COMPONENTS = 20  # cap partner/block dimensionality to avoid p >> n degeneracy
 
 INDEPENDENCE_FIELDS = (
     "dataset",
@@ -59,37 +71,65 @@ def _split_topgen_by_block(
     }
 
 
-def _prepare_matrix(
-    matrix: np.ndarray,
+def _n_splits(n_samples: int) -> int:
+    """Fold count: 5 when possible, fewer on tiny train sets, at least 2."""
+    return max(2, min(5, n_samples // 4))
+
+
+def _fit_transform(
+    train_raw: np.ndarray,
+    test_raw: np.ndarray,
     rng: np.random.Generator,
-) -> tuple[np.ndarray, PCA | None]:
-    """Standardize; PCA-reduce when p > n."""
-    n_samples, n_features = matrix.shape
+    max_components: int = MAX_COMPONENTS,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Standardize on the train fold; PCA-reduce (capped) when p is large.
+
+    All statistics are fitted on the train fold and applied to the test fold,
+    so there is no leakage across the CV split.
+    """
     scaler = StandardScaler()
-    scaled = scaler.fit_transform(matrix)
-    if n_features <= max(n_samples - 2, 1):
-        return scaled, None
-    n_components = min(n_samples - 2, n_features)
-    pca = PCA(n_components=n_components, random_state=int(rng.integers(0, 2**31 - 1)))
-    return pca.fit_transform(scaled), pca
+    train = scaler.fit_transform(train_raw)
+    test = scaler.transform(test_raw)
+    n_train, n_features = train.shape
+    cap = min(n_train - 2, n_features, max_components)
+    if n_features > cap >= 1:
+        pca = PCA(n_components=cap, random_state=int(rng.integers(0, 2**31 - 1)))
+        train = pca.fit_transform(train)
+        test = pca.transform(test)
+    return train, test
 
 
-def residual_r2(
+def explained_r2(
     block_matrix: np.ndarray,
     partner_matrix: np.ndarray,
     rng: np.random.Generator,
     ridge_alpha: float = RIDGE_ALPHA,
 ) -> float:
-    """Mean 1 - R² from regressing each block column on all partner columns."""
-    x_partner, _ = _prepare_matrix(partner_matrix, rng)
-    x_block, _ = _prepare_matrix(block_matrix, rng)
-    one_minus_r2 = []
-    ridge = Ridge(alpha=ridge_alpha)
-    for col_idx in range(x_block.shape[1]):
-        ridge.fit(x_partner, x_block[:, col_idx])
-        r2 = ridge.score(x_partner, x_block[:, col_idx])
-        one_minus_r2.append(1.0 - float(np.clip(r2, 0.0, 1.0)))
-    return float(np.mean(one_minus_r2))
+    """Mean out-of-sample R² from regressing each block column on the partner.
+
+    Out-of-fold predictions are collected over a K-fold split, then R² is scored
+    per column across all held-out samples. Higher = more of the block's variance
+    is linearly reconstructible from the partner = less orthogonal.
+    """
+    n_samples = block_matrix.shape[0]
+    kf = KFold(
+        n_splits=_n_splits(n_samples),
+        shuffle=True,
+        random_state=int(rng.integers(0, 2**31 - 1)),
+    )
+    oof = np.empty_like(block_matrix, dtype=float)
+    for train_idx, test_idx in kf.split(block_matrix):
+        p_train, p_test = _fit_transform(
+            partner_matrix[train_idx], partner_matrix[test_idx], rng
+        )
+        ridge = Ridge(alpha=ridge_alpha)
+        ridge.fit(p_train, block_matrix[train_idx])  # multi-output
+        oof[test_idx] = ridge.predict(p_test)
+    r2_per_col = [
+        float(np.clip(r2_score(block_matrix[:, col], oof[:, col]), 0.0, 1.0))
+        for col in range(block_matrix.shape[1])
+    ]
+    return float(np.mean(r2_per_col))
 
 
 def cca_mean_rho(
@@ -97,22 +137,43 @@ def cca_mean_rho(
     partner_matrix: np.ndarray,
     rng: np.random.Generator,
 ) -> float:
-    """Mean of top-k canonical correlations after standardize + PCA."""
+    """Mean of top-k canonical correlations, evaluated out-of-sample.
+
+    CCA is fitted on the train fold and the canonical variates are correlated on
+    the held-out fold, so a high-dimensional partner cannot saturate the score.
+    """
     n_samples = block_matrix.shape[0]
-    x_block, _ = _prepare_matrix(block_matrix, rng)
-    x_partner, _ = _prepare_matrix(partner_matrix, rng)
-    k = min(5, n_samples - 2, x_block.shape[1], x_partner.shape[1])
-    if k < 1:
-        return 0.0
-    cca = CCA(n_components=k, max_iter=1000)
-    cca.fit(x_block, x_partner)
-    x_block_c, x_partner_c = cca.transform(x_block, x_partner)
-    rhos = []
-    for comp_idx in range(k):
-        rho = np.corrcoef(x_block_c[:, comp_idx], x_partner_c[:, comp_idx])[0, 1]
-        if np.isfinite(rho):
-            rhos.append(abs(float(rho)))
-    return float(np.mean(rhos)) if rhos else 0.0
+    kf = KFold(
+        n_splits=_n_splits(n_samples),
+        shuffle=True,
+        random_state=int(rng.integers(0, 2**31 - 1)),
+    )
+    fold_rhos: list[float] = []
+    for train_idx, test_idx in kf.split(block_matrix):
+        b_train, b_test = _fit_transform(
+            block_matrix[train_idx], block_matrix[test_idx], rng
+        )
+        p_train, p_test = _fit_transform(
+            partner_matrix[train_idx], partner_matrix[test_idx], rng
+        )
+        k = min(5, b_train.shape[1], p_train.shape[1], b_train.shape[0] - 1)
+        if k < 1:
+            continue
+        cca = CCA(n_components=k, max_iter=1000)
+        try:
+            cca.fit(b_train, p_train)
+            b_test_c, p_test_c = cca.transform(b_test, p_test)
+        except Exception:
+            continue
+        for comp_idx in range(k):
+            b_var = b_test_c[:, comp_idx]
+            p_var = p_test_c[:, comp_idx]
+            if np.std(b_var) == 0 or np.std(p_var) == 0:
+                continue
+            rho = np.corrcoef(b_var, p_var)[0, 1]
+            if np.isfinite(rho):
+                fold_rhos.append(abs(float(rho)))
+    return float(np.mean(fold_rhos)) if fold_rhos else 0.0
 
 
 def permutation_null(
@@ -122,7 +183,13 @@ def permutation_null(
     rng: np.random.Generator,
     n_perm: int,
 ) -> tuple[float, float, float]:
-    """Observed metric, null mean, two-sided-style p-value (>= observed)."""
+    """Observed metric, null mean, and one-sided p-value.
+
+    Both metrics are oriented so that larger = more dependence, so the p-value is
+    the null probability of a value at least as large as observed, i.e. of the
+    partner explaining the block at least as well as it does under the true
+    correspondence.
+    """
     observed = metric_fn(block_matrix, partner_matrix, rng)
     nulls = []
     for _ in range(n_perm):
@@ -178,25 +245,27 @@ def run_independence_experiments(
             print(f"\n{dataset}: train {train_X.shape[0]} samples (feature-feature, no labels)")
             last_dataset = dataset
 
+        print(f"  seed={seed}: feature generators ({', '.join(FEATURE_MODULES)})")
+        feature_blocks = exp.compute_feature_blocks(
+            FEATURE_MODULES,
+            train_X,
+            train_y,
+            train_X,
+            seed,
+            topgen_kwargs,
+        )
+        topgen_blocks = _split_topgen_by_block(
+            feature_blocks["topgen"].train,
+            feature_blocks["topgen"].records,
+        )
+
         for partner in PARTNERS:
-            print(f"  seed={seed}: topgen + {partner}")
-            feature_blocks = exp.compute_feature_blocks(
-                ("topgen", partner),
-                train_X,
-                train_y,
-                train_X,
-                seed,
-                topgen_kwargs,
-            )
-            topgen_blocks = _split_topgen_by_block(
-                feature_blocks["topgen"].train,
-                feature_blocks["topgen"].records,
-            )
+            print(f"  seed={seed}: independence vs {partner}")
             partner_matrix = feature_blocks[partner].train
 
             for block, block_matrix in topgen_blocks.items():
                 for metric_name, metric_fn in (
-                    ("residual_r2", residual_r2),
+                    ("explained_r2", explained_r2),
                     ("cca_mean_rho", cca_mean_rho),
                 ):
                     observed, null_mean, p_value = permutation_null(
@@ -236,7 +305,7 @@ def run_independence_experiments(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="TopGen block independence vs catch22/TSFresh (residual-R² + CCA)"
+        description="TopGen block independence vs catch22/TSFresh (explained-R² + CCA)"
     )
     parser.add_argument("--quick", action="store_true", help="GunPoint, seed 0, n_perm=50")
     parser.add_argument(

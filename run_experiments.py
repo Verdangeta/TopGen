@@ -178,6 +178,7 @@ def explain_runtime_cost(
     n_seeds: int,
     methods: tuple[str, ...],
     run_cv: bool,
+    cv_folds: int | None = None,
 ) -> None:
     """Print cross-barcode budget — dominant cost even on small UCR series."""
     density_repeats = topgen_kwargs.get("density_repeats", 1)
@@ -189,7 +190,8 @@ def explain_runtime_cost(
     fit_xbarc = n_train * n_classes * 2 + n_train * max(density_repeats - 1, 0)
     test_xbarc = n_test * n_classes * 2
     per_holdout = fit_xbarc + test_xbarc
-    cv_multiplier = 1 + CV_FOLDS if run_cv else 1
+    n_cv_folds = CV_FOLDS if cv_folds is None else cv_folds
+    cv_multiplier = 1 + n_cv_folds if run_cv else 1
     feature_splits = n_datasets * n_seeds * cv_multiplier
     classifier_fits = feature_splits * n_methods
     topgen_passes = feature_splits if "topgen" in generators else 0
