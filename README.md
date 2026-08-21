@@ -1,4 +1,4 @@
-# TopGen v2
+# TopGen-IC: Inter-Class Cross-Persistent Homology Features for Time-Series Classification
 
 Population-level features for time-series classification.
 
