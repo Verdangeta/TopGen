@@ -16,7 +16,6 @@ from sklearn.metrics import accuracy_score
 from sklearn.model_selection import StratifiedKFold
 
 import run_experiments as exp
-from run_modular_cawpe_experiments import cawpe_weights
 
 try:
     from tqdm import tqdm
@@ -46,6 +45,20 @@ CAWPE_WEIGHT_FIELDS = (
     "weight",
     "cawpe_alpha",
 )
+
+
+def cawpe_weights(
+    module_names: tuple[str, ...],
+    module_accuracies: dict[str, float],
+    alpha: float,
+) -> tuple[np.ndarray, dict[str, float]]:
+    """Normalize acc_j**alpha weights over the modules in one ensemble."""
+    raw = {name: module_accuracies[name] ** alpha for name in module_names}
+    total = sum(raw.values())
+    if total <= 0.0:
+        raise ValueError(f"Non-positive CAWPE weight sum for modules {module_names}: {raw}")
+    normalized = {name: value / total for name, value in raw.items()}
+    return np.array([normalized[name] for name in module_names]), normalized
 
 
 def build_stacking_matrix(
